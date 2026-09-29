@@ -4398,8 +4398,8 @@ static struct layout_effective_run *layout_get_effective_run_for_position(struct
     return NULL;
 }
 
-/* A dummy zero-length hit test box that follows the text, as returned by
-   HitTestTextPosition() for position == layout text length. */
+/* A dummy zero-length hit test box that follows the text, as returned by HitTestTextPosition()
+   and HitTestTextRange() for position == layout text length. */
 static void layout_hit_test_get_trailing_box(struct dwrite_textlayout *layout,
         DWRITE_HIT_TEST_METRICS *metrics)
 {
@@ -4521,14 +4521,163 @@ static HRESULT WINAPI dwritetextlayout_HitTestTextPosition(IDWriteTextLayout4 *i
     return S_OK;
 }
 
+static void layout_hit_test_flush_box(DWRITE_HIT_TEST_METRICS *metrics, UINT32 max_metricscount,
+        UINT32 *total, FLOAT origin_x, FLOAT origin_y, const DWRITE_HIT_TEST_METRICS *box)
+{
+    (*total)++;
+    if (metrics && *total <= max_metricscount)
+    {
+        metrics[*total - 1] = *box;
+        metrics[*total - 1].left += origin_x;
+        metrics[*total - 1].top += origin_y;
+    }
+}
+
 static HRESULT WINAPI dwritetextlayout_HitTestTextRange(IDWriteTextLayout4 *iface,
     UINT32 textPosition, UINT32 textLength, FLOAT originX, FLOAT originY,
     DWRITE_HIT_TEST_METRICS *metrics, UINT32 max_metricscount, UINT32* actual_metricscount)
 {
-    FIXME("%p, %u, %u, %f, %f, %p, %u, %p): stub\n", iface, textPosition, textLength, originX, originY, metrics,
+    struct dwrite_textlayout *layout = impl_from_IDWriteTextLayout4(iface);
+    struct layout_effective_run *box_run = NULL;
+    struct layout_effective_run *run;
+    DWRITE_HIT_TEST_METRICS box;
+    UINT32 start, end, total = 0;
+    bool box_open = false;
+    HRESULT hr;
+
+    TRACE("%p, %u, %u, %f, %f, %p, %u, %p.\n", iface, textPosition, textLength, originX, originY, metrics,
         max_metricscount, actual_metricscount);
 
-    return E_NOTIMPL;
+    if (FAILED(hr = layout_compute_effective_runs(layout)))
+        return hr;
+
+    start = min(textPosition, layout->length);
+
+    if (start == layout->length)
+    {
+        /* Trailing position is reported as a single dummy box, same as in HitTestTextPosition(). */
+        layout_hit_test_get_trailing_box(layout, &box);
+        layout_hit_test_flush_box(metrics, max_metricscount, &total, originX, originY, &box);
+
+        *actual_metricscount = total;
+        return max_metricscount >= 1 ? S_OK : E_NOT_SUFFICIENT_BUFFER;
+    }
+
+    end = start + min(textLength, layout->length - start);
+
+    LIST_FOR_EACH_ENTRY(run, &layout->effective_runs, struct layout_effective_run, entry)
+    {
+        UINT32 seg_from, seg_to;
+        UINT8 level;
+        unsigned int cluster, cursor, cluster0, seg_pos;
+        UINT32 seg_len = 0;
+        float seg_width = 0.0f;
+
+        if (run->start_position + run->length <= start)
+            continue;
+        if (run->start_position >= end)
+            break;
+
+        if (run->object)
+        {
+            /* As in HitTestTextPosition(), an inline object is reported as a single
+               whole-run box, and object boxes are never merged into adjacent boxes. */
+            if (box_open)
+            {
+                layout_hit_test_flush_box(metrics, max_metricscount, &total, originX, originY, &box);
+                box_open = false;
+            }
+
+            box.textPosition = run->start_position;
+            box.length = run->length;
+            box.left = run->origin.x + run->align_dx;
+            box.top = run->origin.y - run->line->baseline;
+            box.width = run->width;
+            box.height = 0.0f;
+            box.bidiLevel = run->bidi_level;
+            box.isText = run->trimming;
+            box.isTrimmed = run->trimming;
+            layout_hit_test_flush_box(metrics, max_metricscount, &total, originX, originY, &box);
+            continue;
+        }
+
+        level = run->run->u.regular.run.bidiLevel;
+        seg_from = max(run->start_position, start);
+        seg_to = min(run->start_position + run->length, end);
+
+        cluster = run->first_cluster;
+        cursor = run->start_position;
+
+        /* Skip clusters fully located before the requested range. */
+        while (cursor < seg_to && cluster < layout->cluster_count &&
+                cursor + layout->clustermetrics[cluster].length <= seg_from)
+        {
+            cursor += layout->clustermetrics[cluster].length;
+            cluster++;
+        }
+
+        if (cursor >= seg_to || cluster >= layout->cluster_count)
+            continue;
+
+        /* In-range clusters are reported fully, without splitting a cluster in the middle. */
+        cluster0 = cluster;
+        seg_pos = cursor;
+        while (cursor < seg_to && cluster < layout->cluster_count)
+        {
+            seg_len += layout->clustermetrics[cluster].length;
+            seg_width += layout->clustermetrics[cluster].width;
+            cursor += layout->clustermetrics[cluster].length;
+            cluster++;
+        }
+
+        /* A zero-width newline cluster is not given a separate box, it extends the line
+           box it ends. Otherwise a new box is started when the run belongs to a different
+           line, or bidi level or trimming flags differ. */
+        if (box_open && run->line == box_run->line && level == box.bidiLevel &&
+                !!run->trimming == !!box.isTrimmed)
+        {
+            box.length += seg_len;
+            box.width += seg_width;
+            if (level & 1)
+            {
+                /* In RTL a later logical run is visually placed to the left of the box. */
+                float seg_left = run->left + run->align_dx + run->width
+                    - get_cluster_range_width(layout, run->first_cluster, cluster);
+
+                box.left = min(box.left, seg_left);
+            }
+        }
+        else
+        {
+            if (box_open)
+                layout_hit_test_flush_box(metrics, max_metricscount, &total, originX, originY, &box);
+
+            box.textPosition = seg_pos;
+            box.length = seg_len;
+            box.left = run->left + run->align_dx;
+            if (level & 1)
+            {
+                box.left += run->width;
+                box.left -= get_cluster_range_width(layout, run->first_cluster, cluster);
+            }
+            else
+                box.left += get_cluster_range_width(layout, run->first_cluster, cluster0);
+            box.width = seg_width;
+            box.top = run->origin.y - run->line->baseline;
+            box.height = run->line->height;
+            box.bidiLevel = level;
+            box.isText = TRUE;
+            box.isTrimmed = run->trimming;
+            box_run = run;
+            box_open = true;
+        }
+    }
+
+    if (box_open)
+        layout_hit_test_flush_box(metrics, max_metricscount, &total, originX, originY, &box);
+
+    *actual_metricscount = total;
+    return max_metricscount >= total ? S_OK : E_NOT_SUFFICIENT_BUFFER;
 }
 
 static HRESULT WINAPI dwritetextlayout1_SetPairKerning(IDWriteTextLayout4 *iface, BOOL is_pairkerning_enabled,
