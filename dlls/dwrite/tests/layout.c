@@ -7286,27 +7286,19 @@ static void test_HitTestTextRange(void)
     /* Start index exceeding layout text length, dummy range returned. */
     count = 0;
     hr = IDWriteTextLayout_HitTestTextRange(layout, 7, 10, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
-    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
-if (SUCCEEDED(hr))
-{
     ok(count == 1, "Unexpected metrics count %u.\n", count);
     ok(metrics[0].textPosition == 6 && metrics[0].length == 0, "Unexpected metrics range %u, %u.\n",
             metrics[0].textPosition, metrics[0].length);
     ok(!!metrics[0].isText, "Expected text range.\n");
-}
     /* Length exceeding layout text length, trimmed. */
     count = 0;
     hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 10, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
-    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
-if (SUCCEEDED(hr))
-{
     ok(count == 1, "Unexpected metrics count %u.\n", count);
     ok(metrics[0].textPosition == 0 && metrics[0].length == 6, "Unexpected metrics range %u, %u.\n",
             metrics[0].textPosition, metrics[0].length);
     ok(!!metrics[0].isText, "Expected text range.\n");
-}
     /* Change font size for second half. */
     range.startPosition = 3;
     range.length = 3;
@@ -7315,10 +7307,7 @@ if (SUCCEEDED(hr))
 
     count = 0;
     hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 6, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
-    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
-if (SUCCEEDED(hr))
-{
     ok(count == 1, "Unexpected metrics count %u.\n", count);
     ok(metrics[0].textPosition == 0 && metrics[0].length == 6, "Unexpected metrics range %u, %u.\n",
             metrics[0].textPosition, metrics[0].length);
@@ -7327,7 +7316,6 @@ if (SUCCEEDED(hr))
     hr = IDWriteTextLayout_GetLineMetrics(layout, &line, 1, &count);
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
     ok(line.height == metrics[0].height, "Unexpected range height.\n");
-}
     /* With inline object. */
     hr = IDWriteFactory_CreateEllipsisTrimmingSign(factory, format, &inlineobj);
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
@@ -7337,10 +7325,7 @@ if (SUCCEEDED(hr))
 
     count = 0;
     hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 6, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
-    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
-if (SUCCEEDED(hr))
-{
     ok(count == 2, "Unexpected metrics count %u.\n", count);
     ok(metrics[0].textPosition == 0 && metrics[0].length == 3, "Unexpected metrics range %u, %u.\n",
             metrics[0].textPosition, metrics[0].length);
@@ -7348,19 +7333,156 @@ if (SUCCEEDED(hr))
     ok(metrics[1].textPosition == 3 && metrics[1].length == 3, "Unexpected metrics range %u, %u.\n",
             metrics[1].textPosition, metrics[1].length);
     ok(!metrics[1].isText, "Unexpected text range.\n");
-}
     count = 0;
     hr = IDWriteTextLayout_HitTestTextRange(layout, 7, 10, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
-    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
-if (SUCCEEDED(hr))
-{
     ok(count == 1, "Unexpected metrics count %u.\n", count);
     ok(metrics[0].textPosition == 6 && metrics[0].length == 0, "Unexpected metrics range %u, %u.\n",
             metrics[0].textPosition, metrics[0].length);
     ok(!metrics[0].isText, "Unexpected text range.\n");
-}
+
     IDWriteInlineObject_Release(inlineobj);
+    IDWriteTextLayout_Release(layout);
+    IDWriteTextFormat_Release(format);
+
+    IDWriteFactory_Release(factory);
+}
+
+static void test_HitTestTextRange_extra(void)
+{
+    DWRITE_HIT_TEST_METRICS metrics2[10];
+    DWRITE_HIT_TEST_METRICS metrics[10];
+    DWRITE_HIT_TEST_METRICS metrics_small[1];
+    DWRITE_LINE_METRICS line_metrics[2];
+    DWRITE_TEXT_METRICS layout_metrics;
+    IDWriteInlineObject *inlineobj;
+    IDWriteTextFormat *format;
+    IDWriteTextLayout *layout;
+    DWRITE_TEXT_RANGE range;
+    IDWriteFactory *factory;
+    unsigned int count, count2, i;
+    HRESULT hr;
+
+    factory = create_factory();
+
+    hr = IDWriteFactory_CreateTextFormat(factory, L"Tahoma", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 10.0f, L"en-US", &format);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = IDWriteFactory_CreateTextLayout(factory, L"string", 6, format, 100.0f, 100.0f, &layout);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    /* Sizing call: the metrics buffer is optional, the count is always set. */
+    count = 123;
+    hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 6, 0.0f, 0.0f, NULL, 0, &count);
+    ok(hr == E_NOT_SUFFICIENT_BUFFER, "Unexpected hr %#lx.\n", hr);
+    ok(count == 1, "Unexpected metrics count %u.\n", count);
+
+    hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 6, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(count == 1, "Unexpected metrics count %u.\n", count);
+    ok(metrics[0].textPosition == 0 && metrics[0].length == 6, "Unexpected metrics range %u, %u.\n",
+            metrics[0].textPosition, metrics[0].length);
+    ok(metrics[0].left == 0.0f, "Unexpected left %.8e.\n", metrics[0].left);
+    ok(metrics[0].top == 0.0f, "Unexpected top %.8e.\n", metrics[0].top);
+
+    /* Zero length range inside the text reports no boxes. This behavior is a local
+       choice, no native evidence of how Windows handles this exists. */
+    count = 123;
+    hr = IDWriteTextLayout_HitTestTextRange(layout, 1, 0, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(count == 0, "Unexpected metrics count %u.\n", count);
+
+    IDWriteTextLayout_Release(layout);
+
+    /* Insufficient buffer reports the total count and copies leading boxes that fit,
+       like GetClusterMetrics() does. Not verified against Windows. */
+    hr = IDWriteFactory_CreateTextLayout(factory, L"string", 6, format, 100.0f, 100.0f, &layout);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    range.startPosition = 3;
+    range.length = 3;
+    hr = IDWriteFactory_CreateEllipsisTrimmingSign(factory, format, &inlineobj);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IDWriteTextLayout_SetInlineObject(layout, inlineobj, range);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    count = 0;
+    hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 6, 0.0f, 0.0f, metrics_small, ARRAY_SIZE(metrics_small), &count);
+    ok(hr == E_NOT_SUFFICIENT_BUFFER, "Unexpected hr %#lx.\n", hr);
+    ok(count == 2, "Unexpected metrics count %u.\n", count);
+    ok(metrics_small[0].textPosition == 0 && metrics_small[0].length == 3, "Unexpected metrics range %u, %u.\n",
+            metrics_small[0].textPosition, metrics_small[0].length);
+    ok(!!metrics_small[0].isText, "Expected text range.\n");
+
+    IDWriteInlineObject_Release(inlineobj);
+    IDWriteTextLayout_Release(layout);
+
+    /* Multi-line layout. */
+    hr = IDWriteFactory_CreateTextLayout(factory, L"aaa\rbbb", 7, format, 100.0f, 100.0f, &layout);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = IDWriteTextLayout_GetLineMetrics(layout, line_metrics, ARRAY_SIZE(line_metrics), &count2);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(count2 == 2, "Unexpected count %u.\n", count2);
+
+    count = 0;
+    hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 7, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    /* The zero-width newline cluster is merged into its line box here, while Windows
+       could report it as a separate zero-width box, so only invariants that hold for
+       both decompositions are asserted. A separate newline box is still part of the
+       layout text, so isText for every reported box is assumed. */
+    ok(count >= 2, "Unexpected metrics count %u.\n", count);
+    ok(metrics[0].textPosition == 0, "Unexpected text position %u.\n", metrics[0].textPosition);
+    ok(metrics[0].left == 0.0f, "Unexpected left %.8e.\n", metrics[0].left);
+    ok(metrics[0].top == 0.0f, "Unexpected top %.8e.\n", metrics[0].top);
+    ok(metrics[count - 1].textPosition + metrics[count - 1].length == 7, "Unexpected metrics range %u, %u.\n",
+            metrics[count - 1].textPosition, metrics[count - 1].length);
+    ok(metrics[count - 1].top > 0.0f, "Unexpected top %.8e.\n", metrics[count - 1].top);
+    for (i = 0; i < count; i++)
+    {
+        /* Boxes of the first line start at zero top, second line boxes don't. */
+        ok(metrics[i].height == line_metrics[metrics[i].top == 0.0f ? 0 : 1].height,
+                "Unexpected height %.8e.\n", metrics[i].height);
+        ok(!!metrics[i].isText, "Unexpected isText %d.\n", metrics[i].isText);
+    }
+
+    /* Origin is added to left/top of every returned box. */
+    hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 7, 5.0f, 7.0f, metrics2, ARRAY_SIZE(metrics2), &count2);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(count2 == count, "Unexpected metrics count %u.\n", count2);
+    for (i = 0; i < count; i++)
+    {
+        ok(metrics2[i].left == metrics[i].left + 5.0f, "Unexpected left %.8e.\n", metrics2[i].left);
+        ok(metrics2[i].top == metrics[i].top + 7.0f, "Unexpected top %.8e.\n", metrics2[i].top);
+    }
+
+    IDWriteTextLayout_Release(layout);
+
+    /* Empty text layout. */
+    hr = IDWriteFactory_CreateTextLayout(factory, L"", 0, format, 100.0f, 100.0f, &layout);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = IDWriteTextLayout_GetMetrics(layout, &layout_metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(layout_metrics.lineCount == 1, "Unexpected line count %u.\n", layout_metrics.lineCount);
+    ok(layout_metrics.height > 0.0f, "Unexpected height %.8e.\n", layout_metrics.height);
+
+    count = 0;
+    hr = IDWriteTextLayout_HitTestTextRange(layout, 0, 10, 0.0f, 0.0f, metrics, ARRAY_SIZE(metrics), &count);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(count == 1, "Unexpected metrics count %u.\n", count);
+    ok(metrics[0].textPosition == 0, "Unexpected text position %u.\n", metrics[0].textPosition);
+    ok(metrics[0].length == 0, "Unexpected length %u.\n", metrics[0].length);
+    ok(metrics[0].left == 0.0f, "Unexpected left %.8e.\n", metrics[0].left);
+    ok(metrics[0].top == 0.0f, "Unexpected top %.8e.\n", metrics[0].top);
+    ok(metrics[0].width == 0.0f, "Unexpected width %.8e.\n", metrics[0].width);
+    ok(metrics[0].height == layout_metrics.height, "Unexpected height %.8e.\n", metrics[0].height);
+    ok(!metrics[0].bidiLevel, "Unexpected bidi level %u.\n", metrics[0].bidiLevel);
+    ok(!!metrics[0].isText, "Unexpected isText %d.\n", metrics[0].isText);
+    ok(!metrics[0].isTrimmed, "Unexpected isTrimmed %d.\n", metrics[0].isTrimmed);
+
     IDWriteTextLayout_Release(layout);
     IDWriteTextFormat_Release(format);
 
@@ -7926,6 +8048,63 @@ static void test_HitTestTextPosition(void)
     IDWriteFactory_Release(factory);
 }
 
+static void test_HitTestTextPosition_empty_layout(void)
+{
+    DWRITE_TEXT_METRICS layout_metrics;
+    DWRITE_HIT_TEST_METRICS metrics;
+    IDWriteTextFormat *format;
+    IDWriteTextLayout *layout;
+    IDWriteFactory *factory;
+    float posx, posy;
+    HRESULT hr;
+
+    factory = create_factory();
+
+    hr = IDWriteFactory_CreateTextFormat(factory, L"Tahoma", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 10.0f, L"en-US", &format);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    /* Empty string layout. */
+    hr = IDWriteFactory_CreateTextLayout(factory, L"", 0, format, 100.0f, 100.0f, &layout);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = IDWriteTextLayout_GetMetrics(layout, &layout_metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    /* An empty layout formats into one line with the formatting's line height. */
+    ok(layout_metrics.lineCount == 1, "Unexpected line count %u.\n", layout_metrics.lineCount);
+    ok(layout_metrics.height > 0.0f, "Unexpected height %.8e.\n", layout_metrics.height);
+
+    hr = IDWriteTextLayout_HitTestTextPosition(layout, 0, FALSE, &posx, &posy, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(posx == metrics.left && posy == metrics.top, "Unexpected position {%.8e,%.8e}.\n", posx, posy);
+    ok(metrics.textPosition == 0, "Unexpected text position %u.\n", metrics.textPosition);
+    ok(metrics.length == 0, "Unexpected length %u.\n", metrics.length);
+    ok(metrics.left == 0.0f, "Unexpected left %.8e.\n", metrics.left);
+    ok(metrics.top == 0.0f, "Unexpected top %.8e.\n", metrics.top);
+    ok(metrics.width == 0.0f, "Unexpected width %.8e.\n", metrics.width);
+    ok(metrics.height == layout_metrics.height, "Unexpected height %.8e.\n", metrics.height);
+    ok(!metrics.bidiLevel, "Unexpected bidi level %u.\n", metrics.bidiLevel);
+    ok(metrics.isText, "Unexpected isText %d.\n", metrics.isText);
+    ok(!metrics.isTrimmed, "Unexpected isTrimmed %d.\n", metrics.isTrimmed);
+
+    hr = IDWriteTextLayout_HitTestTextPosition(layout, 0, TRUE, &posx, &posy, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(posx == metrics.left && posy == metrics.top, "Unexpected position {%.8e,%.8e}.\n", posx, posy);
+    ok(metrics.textPosition == 0, "Unexpected text position %u.\n", metrics.textPosition);
+    ok(metrics.length == 0, "Unexpected length %u.\n", metrics.length);
+    ok(metrics.left == 0.0f, "Unexpected left %.8e.\n", metrics.left);
+    ok(metrics.top == 0.0f, "Unexpected top %.8e.\n", metrics.top);
+    ok(metrics.width == 0.0f, "Unexpected width %.8e.\n", metrics.width);
+    ok(metrics.height == layout_metrics.height, "Unexpected height %.8e.\n", metrics.height);
+    ok(!metrics.bidiLevel, "Unexpected bidi level %u.\n", metrics.bidiLevel);
+    ok(metrics.isText, "Unexpected isText %d.\n", metrics.isText);
+    ok(!metrics.isTrimmed, "Unexpected isTrimmed %d.\n", metrics.isTrimmed);
+
+    IDWriteTextLayout_Release(layout);
+    IDWriteTextFormat_Release(format);
+    IDWriteFactory_Release(factory);
+}
+
 START_TEST(layout)
 {
     IDWriteFactory *factory;
@@ -7982,7 +8161,9 @@ START_TEST(layout)
     test_text_format_axes();
     test_layout_range_length();
     test_HitTestTextRange();
+    test_HitTestTextRange_extra();
     test_HitTestTextPosition();
+    test_HitTestTextPosition_empty_layout();
 
     IDWriteFactory_Release(factory);
 }
