@@ -7489,6 +7489,169 @@ static void test_HitTestTextRange_extra(void)
     IDWriteFactory_Release(factory);
 }
 
+static void test_HitTestPoint(void)
+{
+    DWRITE_CLUSTER_METRICS cluster_metrics[8];
+    DWRITE_LINE_METRICS line_metrics[2];
+    DWRITE_TEXT_METRICS layout_metrics;
+    DWRITE_HIT_TEST_METRICS metrics;
+    IDWriteTextFormat *format;
+    IDWriteTextLayout *layout;
+    float x0, x1, x5, x6, x4, x5b;
+    float mid, y0, y_line2, x_far, px, py;
+    BOOL trailing, inside;
+    unsigned int i, count, expected;
+    IDWriteFactory *factory;
+    HRESULT hr;
+
+    factory = create_factory();
+
+    hr = IDWriteFactory_CreateTextFormat(factory, L"Tahoma", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 10.0f, L"en-US", &format);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = IDWriteFactory_CreateTextLayout(factory, L"string", 6, format, 100.0f, 100.0f, &layout);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    /* Cluster band edges of the single line, derived from HitTestTextPosition(). */
+    hr = IDWriteTextLayout_HitTestTextPosition(layout, 0, FALSE, &x0, &y0, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(y0 == 0.0f, "Unexpected cluster top %.8e.\n", y0);
+    hr = IDWriteTextLayout_HitTestTextPosition(layout, 1, FALSE, &x1, &y0, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IDWriteTextLayout_HitTestTextPosition(layout, 5, FALSE, &x5, &y0, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IDWriteTextLayout_HitTestTextPosition(layout, 6, FALSE, &x6, &y0, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    /* A hit at the leading edge of the first cluster. */
+    hr = IDWriteTextLayout_HitTestPoint(layout, x0, y0, &trailing, &inside, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(metrics.textPosition == 0, "Unexpected text position %u.\n", metrics.textPosition);
+    ok(!trailing, "Unexpected trailing hit.\n");
+    /* is_inside is only set when the point is inside the selected line's vertical band. */
+    ok(inside, "Unexpected inside %d.\n");
+
+    /* A hit in the right half of the first cluster is a trailing hit. */
+    mid = 0.5f * (x0 + x1);
+    hr = IDWriteTextLayout_HitTestPoint(layout, mid, y0, &trailing, &inside, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(metrics.textPosition == 0, "Unexpected text position %u.\n", metrics.textPosition);
+    ok(trailing, "Expected trailing hit.\n");
+    ok(inside, "Unexpected inside %d.\n");
+
+    /* A hit in the right half of the last cluster. */
+    mid = 0.5f * (x5 + x6);
+    hr = IDWriteTextLayout_HitTestPoint(layout, mid, y0, &trailing, &inside, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(metrics.textPosition == 5, "Unexpected text position %u.\n", metrics.textPosition);
+    ok(trailing, "Expected trailing hit.\n");
+    ok(inside, "Unexpected inside %d.\n");
+
+    /* Points left of the leading band edge and beyond the last band are reported as the
+       nearest positions, is_trailinghit False. This is not evidenced by native tests, it
+       mirrors what HitTestTextPosition() reports for the position the point clamps to. */
+    hr = IDWriteTextLayout_HitTestPoint(layout, x6, y0, &trailing, &inside, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(metrics.textPosition == 6, "Unexpected text position %u.\n", metrics.textPosition);
+    ok(!trailing, "Unexpected trailing hit.\n");
+    ok(!inside, "Unexpected inside %d.\n");
+    hr = IDWriteTextLayout_HitTestPoint(layout, x6 + 50.0f, y0, &trailing, &inside, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(metrics.textPosition == 6, "Unexpected text position %u.\n", metrics.textPosition);
+    ok(!trailing, "Unexpected trailing hit.\n");
+    ok(!inside, "Unexpected inside %d.\n");
+
+    hr = IDWriteTextLayout_HitTestTextPosition(layout, 6, FALSE, &px, &py, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IDWriteTextLayout_HitTestPoint(layout, x6 + 50.0f, y0, &trailing, &inside, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(metrics.left == px && metrics.top == py, "Unexpected trailing box origin.\n");
+    hr = IDWriteTextLayout_HitTestPoint(layout, -100.0f, y0, &trailing, &inside, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(metrics.textPosition == 0, "Unexpected text position %u.\n", metrics.textPosition);
+    ok(!trailing, "Unexpected trailing hit.\n");
+    ok(!inside, "Unexpected inside %d.\n");
+
+    IDWriteTextLayout_Release(layout);
+
+    hr = IDWriteFactory_CreateTextLayout(factory, L"aaa\rbbb", 7, format, 100.0f, 100.0f, &layout);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    count = ARRAY_SIZE(line_metrics);
+    hr = IDWriteTextLayout_GetLineMetrics(layout, line_metrics, count, &count);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(count == 2, "Unexpected line count %u.\n", count);
+    ok(line_metrics[0].height > 0.0f, "Unexpected line height %.8e.\n", line_metrics[0].height);
+
+    count = ARRAY_SIZE(cluster_metrics);
+    hr = IDWriteTextLayout_GetClusterMetrics(layout, cluster_metrics, count, &count);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(count == 7, "Unexpected cluster count %u.\n", count);
+
+    expected = 0;
+    for (i = 0; i < count; i++)
+    {
+        if (cluster_metrics[i].isNewline)
+            break;
+        expected += cluster_metrics[i].length;
+    }
+    ok(expected == 3, "Unexpected newline cluster position %u.\n", expected);
+
+    y_line2 = line_metrics[0].height;
+
+    /* The first cluster band of the second line, from HitTestTextPosition(). */
+    hr = IDWriteTextLayout_HitTestTextPosition(layout, 4, FALSE, &x4, &y_line2, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IDWriteTextLayout_HitTestTextPosition(layout, 5, FALSE, &x5b, &y_line2, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    /* A hit in the right half of the first cluster of the second line. */
+    mid = 0.5f * (x4 + x5b);
+    hr = IDWriteTextLayout_HitTestPoint(layout, mid, y_line2, &trailing, &inside, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(metrics.textPosition == 4, "Unexpected text position %u.\n", metrics.textPosition);
+    ok(trailing, "Expected trailing hit.\n");
+    ok(inside, "Unexpected inside %d.\n");
+
+    x_far = x5b + 100.0f;
+
+    /* Points beyond the last band resolve per selected line: the last line reports the
+       layout end, a terminated earlier line reports its newline cluster position. */
+    hr = IDWriteTextLayout_HitTestPoint(layout, x_far, y_line2, &trailing, &inside, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(metrics.textPosition == 7, "Unexpected text position %u.\n", metrics.textPosition);
+    ok(!trailing, "Unexpected trailing hit.\n");
+    ok(!inside, "Unexpected inside %d.\n");
+
+    hr = IDWriteTextLayout_HitTestPoint(layout, x_far, 0.5f, &trailing, &inside, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(metrics.textPosition == expected, "Unexpected text position %u.\n", metrics.textPosition);
+    ok(!trailing, "Unexpected trailing hit.\n");
+    ok(!inside, "Unexpected inside %d.\n");
+
+    IDWriteTextLayout_Release(layout);
+
+    hr = IDWriteFactory_CreateTextLayout(factory, L"", 0, format, 100.0f, 100.0f, &layout);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = IDWriteTextLayout_GetMetrics(layout, &layout_metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(layout_metrics.lineCount == 1, "Unexpected line count %u.\n", layout_metrics.lineCount);
+    ok(layout_metrics.height > 0.0f, "Unexpected height %.8e.\n", layout_metrics.height);
+
+    /* An empty layout resolves any point to the dummy line start, an empty trailing box. */
+    hr = IDWriteTextLayout_HitTestPoint(layout, 10.0f, 5.0f, &trailing, &inside, &metrics);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(metrics.textPosition == 0, "Unexpected text position %u.\n", metrics.textPosition);
+    ok(!trailing, "Unexpected trailing hit.\n");
+    ok(!inside, "Unexpected inside %d.\n");
+
+    IDWriteTextLayout_Release(layout);
+    IDWriteTextFormat_Release(format);
+    IDWriteFactory_Release(factory);
+}
+
 static void test_HitTestTextPosition(void)
 {
     DWRITE_CLUSTER_METRICS clusters[10];
@@ -8162,6 +8325,7 @@ START_TEST(layout)
     test_layout_range_length();
     test_HitTestTextRange();
     test_HitTestTextRange_extra();
+    test_HitTestPoint();
     test_HitTestTextPosition();
     test_HitTestTextPosition_empty_layout();
 
