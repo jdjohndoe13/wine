@@ -4398,6 +4398,48 @@ static struct layout_effective_run *layout_get_effective_run_for_position(struct
     return NULL;
 }
 
+/* A dummy zero-length hit test box that follows the text, as returned by
+   HitTestTextPosition() for position == layout text length. */
+static void layout_hit_test_get_trailing_box(struct dwrite_textlayout *layout,
+        DWRITE_HIT_TEST_METRICS *metrics)
+{
+    struct layout_effective_run *run;
+    struct layout_line *line;
+    UINT8 level;
+
+    run = layout_get_trailing_effective_run(layout);
+    line = LIST_ENTRY(list_tail(&layout->lines), struct layout_line, entry);
+
+    if (!run)
+    {
+        /* Trailing run lookup fails on a layout with no effective runs
+           (e.g. empty text formatted into a single dummy line). Produce a
+           zero-width box past the text, derived from the last line. */
+        metrics->textPosition = layout->length;
+        metrics->length = 0;
+        metrics->left = 0.0f;
+        metrics->width = 0.0f;
+        metrics->top = layout->metrics.height - line->metrics.height;
+        metrics->height = line->metrics.height;
+        metrics->bidiLevel = 0;
+        metrics->isText = TRUE;
+        metrics->isTrimmed = FALSE;
+        return;
+    }
+    level = run->object ? run->bidi_level : run->run->u.regular.run.bidiLevel;
+
+    metrics->textPosition = layout->length;
+    metrics->length = 0;
+    /* Empty box following the last run */
+    metrics->left = run->left + run->align_dx + run->width;
+    metrics->top = layout->metrics.height - line->metrics.height;
+    metrics->width = 0.0f;
+    metrics->height = line->metrics.height;
+    metrics->bidiLevel = level;
+    metrics->isText = run->trimming || !run->object;
+    metrics->isTrimmed = run->trimming;
+}
+
 static HRESULT WINAPI dwritetextlayout_HitTestTextPosition(IDWriteTextLayout4 *iface,
         UINT32 position, BOOL is_trailinghit, FLOAT *point_x, FLOAT *point_y, DWRITE_HIT_TEST_METRICS *metrics)
 {
@@ -4414,22 +4456,7 @@ static HRESULT WINAPI dwritetextlayout_HitTestTextPosition(IDWriteTextLayout4 *i
 
     if (position == layout->length)
     {
-        struct layout_line *line = LIST_ENTRY(list_tail(&layout->lines), struct layout_line, entry);
-        UINT8 level;
-
-        run = layout_get_trailing_effective_run(layout);
-        level = run->object ? run->bidi_level : run->run->u.regular.run.bidiLevel;
-
-        metrics->textPosition = position;
-        metrics->length = 0;
-        /* Empty box following the last run */
-        metrics->left = run->left + run->align_dx + run->width;
-        metrics->top = layout->metrics.height - line->metrics.height;
-        metrics->width = 0.0f;
-        metrics->height = line->metrics.height;
-        metrics->bidiLevel = level;
-        metrics->isText = run->trimming || !run->object;
-        metrics->isTrimmed = run->trimming;
+        layout_hit_test_get_trailing_box(layout, metrics);
 
         *point_x = metrics->left;
         *point_y = metrics->top;
