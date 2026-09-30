@@ -113,6 +113,40 @@ if [ ! -d "$MINGW/src/mingw-w64" ] || [ ! -d "$MINGW/src/binutils" ] \
   [ "$deps" = 1 ] || { echo "ERROR: gcc download_prerequisites failed"; exit 1; }
 fi
 
+echo "=== applying gstreamer-1.14 compat shim (if needed) ==="
+if ! grep -q "shim for gstreamer < 1.16" "$REPO_ROOT/dlls/winegstreamer/wg_transform.c"; then
+  command -v patch >/dev/null || { echo "ERROR: host lacks patch(1)"; exit 1; }
+  patch -d "$REPO_ROOT" -p1 --batch <<'WGSHIM'
+--- a/dlls/winegstreamer/wg_transform.c
++++ b/dlls/winegstreamer/wg_transform.c
+@@ -40,5 +40,22 @@
+ #include "unix_private.h"
+ 
++/* shim for gstreamer < 1.16 (Debian 10 ships 1.14): implement
++ * gst_video_format_info_component() locally, as upstream does. */
++#if !GST_CHECK_VERSION(1, 16, 0)
++static void
++gst_video_format_info_component(const GstVideoFormatInfo *finfo, gint plane,
++        gint components[GST_VIDEO_MAX_COMPONENTS])
++{
++    gint c, i = 0;
++
++    for (c = 0; c < finfo->n_components; c++)
++        if (plane == finfo->plane[c])
++            components[i++] = c;
++    components[i] = -1;
++}
++#endif
+ #define GST_SAMPLE_FLAG_WG_CAPS_CHANGED (GST_MINI_OBJECT_FLAG_LAST << 0)
+ 
+ /* This GstElement takes buffers and events from its sink pad, instead of pushing them
+WGSHIM
+  grep -q "shim for gstreamer < 1.16" "$REPO_ROOT/dlls/winegstreamer/wg_transform.c" \
+    || { echo "ERROR: shim patch failed to apply"; exit 1; }
+else
+  echo "    already applied"
+fi
+
 echo "=== wine x64-only build in docker ($IMAGE) ==="
 echo "    source : $REPO_ROOT"
 echo "    build  : $BUILD/wine"
@@ -122,7 +156,7 @@ echo "    jobs   : $JOBS"
 
 docker run --rm -i \
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -e HOST_JOBS="$JOBS" \
-  -v "$REPO_ROOT":/src:ro \
+  -v "$REPO_ROOT":/src \
   -v "$BUILD":/build \
   -v "$INSTALL":/install \
   -v "$MINGW":/opt/mingw-w64 \
