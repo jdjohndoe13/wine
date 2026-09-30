@@ -18,7 +18,10 @@
 #                 toolchain build. Vulkan is disabled (buster's headers are
 #                 too old for wine 10+; Dr.Explain does not use Vulkan).
 #                 Debian 10 is EOL: apt is pointed at archive.debian.org
-#                 with validity checks off.
+#                 with validity checks off. The mingw-w64-build script
+#                 itself is fetched on the HOST (curl --retry) before the
+#                 container starts: transient container-side network errors
+#                 must not abort a 2-3 h build.
 #
 # Outputs
 #   $BUILD/wine/            out-of-tree build dir
@@ -31,8 +34,11 @@
 #               root-owned files on the host).
 #
 # Usage (Linux box with docker, inside a checkout of this repository):
-#   bash build.sh          # ~2-3 h first run, ~40-90 min on cached runs
-#   All output goes to stdout; capture it when detaching, e.g.:
+#   Recommended: run inside screen/tmux so an ssh disconnect cannot
+#                interrupt the 2-3 h build:
+#     screen -dmS winebuild bash build.sh
+#     screen -r winebuild          # watch live (Ctrl+A D to detach)
+#   Or detached:
 #     nohup bash build.sh > /tmp/d10wine.log 2>&1 &
 # ---------------------------------------------------------------------------
 set -euo pipefail
@@ -51,6 +57,18 @@ command -v docker > /dev/null || { echo "ERROR: docker not available on this hos
 mkdir -p "$BUILD" "$INSTALL" "$MINGW"
 rm -rf "$BUILD/wine"
 
+# --- fetch the cross-toolchain build script on the HOST (retries) ---
+if [ ! -s "$MINGW/mwb.sh" ]; then
+  rm -f "$MINGW/mwb.sh"
+  echo "=== fetching mingw-w64-build (host side) ==="
+  curl -fsSL --retry 5 \
+        https://raw.githubusercontent.com/Kron4ek/Wine-Builds/10.20/mingw-w64-build \
+        -o "$MINGW/mwb.sh" \
+  || wget -q https://raw.githubusercontent.com/Kron4ek/Wine-Builds/10.20/mingw-w64-build \
+        -O "$MINGW/mwb.sh"
+  [ -s "$MINGW/mwb.sh" ] || { echo "ERROR: cannot fetch mingw-w64-build"; exit 1; }
+fi
+
 echo "=== wine x64-only build in docker ($IMAGE) ==="
 echo "    source : $REPO_ROOT"
 echo "    build  : $BUILD/wine"
@@ -67,6 +85,7 @@ docker run --rm -i \
   -w /build \
   "$IMAGE" bash -s <<'EOS'
 set -euo pipefail
+trap 'rc=$?; echo "=== CONTAINER_ERROR rc=$rc at $(date -Iseconds) ===" >&2; exit $rc' ERR
 echo "--- container start $(date -Iseconds), debian $(cat /etc/debian_version), uid=$(id -u) ---"
 
 # ---- 1) Debian 10 is EOL: use the archive, validity checks off ----
@@ -79,7 +98,7 @@ echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99buster-archiv
 apt-get update
 
 # ---- 2) build dependencies (wine 11 + desktop stack + toolchain build) ----
-PKGS='gcc g++ make flex bison gettext texinfo gawk pkg-config ccache
+PKGS='gcc g++ make flex bison gettext texinfo gawk pkg-config ccache curl
       libx11-dev libxext-dev libxrender-dev libxrandr-dev libxi-dev
       libxcursor-dev libxfixes-dev libxcomposite-dev libxinerama-dev
       libxxf86vm-dev libxt-dev libxmu-dev libxkbfile-dev
@@ -93,7 +112,7 @@ PKGS='gcc g++ make flex bison gettext texinfo gawk pkg-config ccache
       libusb-1.0-0-dev libpcap0.8-dev libv4l-dev libcapi20-dev
       libcups2-dev libgphoto2-dev libkrb5-dev libldap2-dev unixodbc-dev
       libpcsclite-dev
-      curl m4 bzip2 ca-certificates git wget xz-utils binutils'
+      m4 bzip2 ca-certificates git wget xz-utils binutils'
 if ! apt-get install -y --no-install-recommends $PKGS; then
   echo "batch apt install failed -- retrying package-by-package (optionals may be skipped)"
   for p in $PKGS; do
@@ -102,13 +121,13 @@ if ! apt-get install -y --no-install-recommends $PKGS; then
 fi
 
 # ---- 3) mingw-w64 cross-toolchain (x86_64), cached across runs ----
+# kron4ek's script requires: g++ flex bison git makeinfo m4 bzip2 curl make diff
+# (all installed above; the script itself is provided from the host.)
 if [ ! -x /opt/mingw-w64/x86_64/bin/x86_64-w64-mingw32-gcc ]; then
   echo "=== cross-toolchain not cached yet -- building once (~1 h) ==="
   mkdir -p /opt/_mwb
   cd /opt/_mwb
-  wget -q https://raw.githubusercontent.com/Kron4ek/Wine-Builds/10.20/mingw-w64-build -O mwb.sh
-  chmod +x mwb.sh
-  ./mwb.sh x86_64 --prefix=/opt/mingw-w64
+  bash /opt/mingw-w64/mwb.sh x86_64 --prefix=/opt/mingw-w64
   if [ ! -x /opt/mingw-w64/x86_64/bin/x86_64-w64-mingw32-gcc ]; then
     probe="$(find /opt/mingw-w64 -type f -name x86_64-w64-mingw32-gcc 2>/dev/null | head -1)"
     if [ -z "$probe" ]; then
@@ -121,7 +140,6 @@ if [ ! -x /opt/mingw-w64/x86_64/bin/x86_64-w64-mingw32-gcc ]; then
 fi
 export PATH="/opt/mingw-w64/x86_64/bin:$PATH"
 x86_64-w64-mingw32-gcc --version | head -1
-x86_64-w64-mingw32-gcc --version | head -2 | tail -1
 
 # ---- 4) configure: SINGLE-ARCH x86_64 (plain ./configure = 32-bit build!) ----
 mkdir -p /build/wine
