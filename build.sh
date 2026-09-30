@@ -126,7 +126,7 @@ if ! grep -q "shim for gstreamer < 1.16" "$REPO_ROOT/dlls/winegstreamer/wg_trans
   patch -d "$REPO_ROOT" -p1 --batch <<'WGSHIM'
 --- a/dlls/winegstreamer/wg_transform.c
 +++ b/dlls/winegstreamer/wg_transform.c
-@@ -40,5 +40,22 @@
+@@ -40,5 +40,20 @@
  #include "unix_private.h"
  
 +/* shim for gstreamer < 1.16 (Debian 10 ships 1.14): implement
