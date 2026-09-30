@@ -90,7 +90,7 @@ if [ ! -d "$MINGW/src/mingw-w64" ] || [ ! -d "$MINGW/src/binutils" ] \
   echo "=== pre-fetching cross-toolchain sources on the host (retries) ==="
   mkdir -p "$MINGW/src"
   fetch_git https://github.com/mingw-w64/mingw-w64.git master "$MINGW/src/mingw-w64"
-  fetch_git https://sourceware.org/git/binutils-gdb.git binutils-2_42-branch "$MINGW/src/binutils"
+  fetch_git https://github.com/bminor/binutils-gdb.git binutils-2_42-branch "$MINGW/src/binutils"  # github mirror: sourceware flaked with HTTP/2 stream errors
   fetch_git https://github.com/gcc-mirror/gcc.git releases/gcc-12 "$MINGW/src/gcc"
   rm -f "$MINGW/src/config.guess"
   curl -fsSL --retry 5 \
