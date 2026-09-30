@@ -244,12 +244,7 @@ W=/install/usr/local/bin/wine
 [ -x "$W" ] || { echo "ERROR: no wine binary in the install tree"; exit 1; }
 ls /install/usr/local/bin
 echo "--- glibc symbol floor of the produced ELF tree (required: 2.28 or lower) ---"
-GLIBC_MAX="$(
-  find /install/usr/local/lib /install/usr/local/bin -type f \
-    \( -name '*.so' -o -name '*.so.*' -o -name 'wine' -o -name 'wine64' -o -name 'wineserver' \) -print0
-    | xargs -0 -n16 objdump -T 2>/dev/null
-    | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1
-)"
+GLIBC_MAX=$(find /install/usr/local/lib /install/usr/local/bin -type f \( -name '*.so' -o -name '*.so.*' -o -name 'wine' -o -name 'wineserver' \) -print0 | xargs -0 -n16 objdump -T 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
 echo "GLIBC_MAX=$GLIBC_MAX"
 echo "--- wine --version inside this same glibc-2.28 container (no X needed) ---"
 LD_LIBRARY_PATH=/install/usr/local/lib /install/usr/local/bin/wine --version
