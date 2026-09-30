@@ -92,11 +92,17 @@ if [ ! -d "$MINGW/src/mingw-w64" ] || [ ! -d "$MINGW/src/binutils" ] \
   fetch_git https://github.com/mingw-w64/mingw-w64.git master "$MINGW/src/mingw-w64"
   fetch_git https://github.com/bminor/binutils-gdb.git binutils-2_42-branch "$MINGW/src/binutils"  # github mirror: sourceware flaked with HTTP/2 stream errors
   fetch_git https://github.com/gcc-mirror/gcc.git releases/gcc-12 "$MINGW/src/gcc"
-  rm -f "$MINGW/src/config.guess"
-  curl -fsSL --retry 5 \
-    "https://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.guess;hb=HEAD" \
-    -o "$MINGW/src/config.guess" || true
-  [ -s "$MINGW/src/config.guess" ] || { echo "ERROR: cannot fetch config.guess"; exit 1; }
+  if [ -s "$MINGW/src/config.guess" ]; then
+    echo "    config.guess already cached"
+  else
+    cp "$MINGW/src/gcc/config.guess" "$MINGW/src/config.guess" 2>/dev/null || true
+  fi
+  if [ ! -s "$MINGW/src/config.guess" ]; then
+    curl -fsSL --retry 5 \
+      "https://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.guess;hb=HEAD" \
+      -o "$MINGW/src/config.guess" || true
+    [ -s "$MINGW/src/config.guess" ] || { echo "ERROR: cannot fetch config.guess"; exit 1; }
+  fi
   echo "=== fetching gcc prerequisites (gmp/mpfr/mpc/isl) on the host ==="
   local deps=0 i
   for i in 1 2 3; do
