@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# build.sh -- build the x86_64-only Wine (this fork) inside Dockerized
+#             Debian 10 (buster), for the Dr.Explain Linux bundle.
+#
+# Why Debian 10 : glibc 2.28 floor -- every produced ELF binary links only
+#                 against glibc symbols <= 2.28, so the bundle also runs on
+#                 older distros (Astra SE 1.7/1.8, RED OS, MSVSphere 9, ...).
+# Why x86_64    : Dr.Explain 7.2 (Inno Setup 7, SetupArchitecture=x64) and
+#                 DrExplain.exe are 64-bit-only PEs; no 32-bit PE is ever
+#                 executed, so the dual-arch (new-WoW64) tree is not needed
+#                 and the bundled payload shrinks by ~25 percent.
+# How           : /src/configure --enable-win64  (single-arch x86_64 -- a
+#                 plain ./configure would build the 32-bit variant!). The PE
+#                 side is built with the mingw-w64 (gcc 12 / binutils 2.42)
+#                 cross-toolchain from Kron4ek's mingw-w64-build script,
+#                 cached in $MINGW so later wine builds skip the ~1 h
+#                 toolchain build. Vulkan is disabled (buster's headers are
+#                 too old for wine 10+; Dr.Explain does not use Vulkan).
+#                 Debian 10 is EOL: apt is pointed at archive.debian.org
+#                 with validity checks off.
+#
+# Outputs
+#   $BUILD/wine/            out-of-tree build dir
+#   $INSTALL/usr/local/     installed tree -- point the bundle assembler
+#                           (d3-aspkg.sh INST=) at this path
+#
+# Re-entrancy : safe to re-run; wine rebuilds from scratch each time, the
+#               cross-toolchain is kept. Outputs are chown'ed back to the
+#               invoking user at the end (the first run must not leave
+#               root-owned files on the host).
+#
+# Usage (Linux box with docker, inside a checkout of this repository):
+#   bash build.sh          # ~2-3 h first run, ~40-90 min on cached runs
+#   All output goes to stdout; capture it when detaching, e.g.:
+#     nohup bash build.sh > /tmp/d10wine.log 2>&1 &
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd -P)"
+IMAGE="${WINE_IMAGE:-debian:buster}"
+BUILD="${WINE_BUILD_DIR:-/home/user/wine-fork-build-x64only}"
+INSTALL="${WINE_INSTALL_DIR:-/home/user/wine-inst-x64only}"
+MINGW="${WINE_MINGW_DIR:-/home/user/mingw-w64-toolchain}"
+JOBS="$(nproc)"
+
+[ -x "$REPO_ROOT/configure" ] || {
+  echo "ERROR: run this script from a checkout of the wine fork (./configure missing)"; exit 1; }
+command -v docker > /dev/null || { echo "ERROR: docker not available on this host"; exit 1; }
+
+mkdir -p "$BUILD" "$INSTALL" "$MINGW"
+rm -rf "$BUILD/wine"
+
+echo "=== wine x64-only build in docker ($IMAGE) ==="
+echo "    source : $REPO_ROOT"
+echo "    build  : $BUILD/wine"
+echo "    install: $INSTALL/usr/local"
+echo "    mingw  : $MINGW (persistent cross-toolchain cache)"
+echo "    jobs   : $JOBS"
+
+docker run --rm -i \
+  -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -e HOST_JOBS="$JOBS" \
+  -v "$REPO_ROOT":/src:ro \
+  -v "$BUILD":/build \
+  -v "$INSTALL":/install \
+  -v "$MINGW":/opt/mingw-w64 \
+  -w /build \
+  "$IMAGE" bash -s <<'EOS'
+set -euo pipefail
+echo "--- container start $(date -Iseconds), debian $(cat /etc/debian_version), uid=$(id -u) ---"
+
+# ---- 1) Debian 10 is EOL: use the archive, validity checks off ----
+rm -f /etc/apt/sources.list.d/*.list 2>/dev/null || true
+cat > /etc/apt/sources.list <<'SL'
+deb [trusted=yes] http://archive.debian.org/debian buster main contrib non-free
+deb [trusted=yes] http://archive.debian.org/debian-security buster/updates main contrib non-free
+SL
+echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99buster-archive
+apt-get update
+
+# ---- 2) build dependencies (wine 11 + desktop stack + toolchain build) ----
+PKGS='gcc g++ make flex bison gettext texinfo gawk pkg-config ccache
+      libx11-dev libxext-dev libxrender-dev libxrandr-dev libxi-dev
+      libxcursor-dev libxfixes-dev libxcomposite-dev libxinerama-dev
+      libxxf86vm-dev libxt-dev libxmu-dev libxkbfile-dev
+      libgl1-mesa-dev libegl1-mesa-dev libglu1-mesa-dev
+      libfontconfig1-dev libfreetype6-dev libunwind-dev
+      libasound2-dev libpulse-dev libdbus-1-dev libudev-dev
+      libgnutls28-dev
+      libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+      libavcodec-dev libavformat-dev libavutil-dev
+      libopenal-dev libsdl2-dev
+      libusb-1.0-0-dev libpcap0.8-dev libv4l-dev libcapi20-dev
+      libcups2-dev libgphoto2-dev libkrb5-dev libldap2-dev unixodbc-dev
+      libpcsclite-dev
+      ca-certificates git wget xz-utils binutils'
+if ! apt-get install -y --no-install-recommends $PKGS; then
+  echo "batch apt install failed -- retrying package-by-package (optionals may be skipped)"
+  for p in $PKGS; do
+    apt-get install -y --no-install-recommends "$p" || echo "APT-SKIP $p"
+  done
+fi
+
+# ---- 3) mingw-w64 cross-toolchain (x86_64), cached across runs ----
+if [ ! -x /opt/mingw-w64/x86_64/bin/x86_64-w64-mingw32-gcc ]; then
+  echo "=== cross-toolchain not cached yet -- building once (~1 h) ==="
+  mkdir -p /opt/_mwb
+  cd /opt/_mwb
+  wget -q https://raw.githubusercontent.com/Kron4ek/Wine-Builds/10.20/mingw-w64-build -O mwb.sh
+  chmod +x mwb.sh
+  ./mwb.sh x86_64 --prefix=/opt/mingw-w64
+  if [ ! -x /opt/mingw-w64/x86_64/bin/x86_64-w64-mingw32-gcc ]; then
+    probe="$(find /opt/mingw-w64 -type f -name x86_64-w64-mingw32-gcc 2>/dev/null | head -1)"
+    if [ -z "$probe" ]; then
+      echo "ERROR: cross-toolchain was built but the compiler binary was not found"; exit 1
+    fi
+    echo "WARN: unexpected toolchain layout; gcc found at: $probe"
+  fi
+  cd /
+  rm -rf /opt/_mwb
+fi
+export PATH="/opt/mingw-w64/x86_64/bin:$PATH"
+x86_64-w64-mingw32-gcc --version | head -1
+x86_64-w64-mingw32-gcc --version | head -2 | tail -1
+
+# ---- 4) configure: SINGLE-ARCH x86_64 (plain ./configure = 32-bit build!) ----
+mkdir -p /build/wine
+cd /build/wine
+/src/configure --enable-win64 --without-vulkan
+
+# ---- 5) build + install ----
+make -j"$HOST_JOBS"
+make install DESTDIR=/install
+
+# ---- 6) sanity checks ----
+W=/install/usr/local/bin/wine
+[ -x "$W" ] || { echo "ERROR: no wine binary in the install tree"; exit 1; }
+ls /install/usr/local/bin
+echo "--- glibc symbol floor of the produced ELF tree (required: 2.28 or lower) ---"
+GLIBC_MAX="$(
+  find /install/usr/local/lib /install/usr/local/bin -type f \
+    \( -name '*.so' -o -name '*.so.*' -o -name 'wine' -o -name 'wine64' -o -name 'wineserver' \) -print0
+    | xargs -0 -n16 objdump -T 2>/dev/null
+    | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1
+)"
+echo "GLIBC_MAX=$GLIBC_MAX"
+echo "--- wine --version inside this same glibc-2.28 container (no X needed) ---"
+LD_LIBRARY_PATH=/install/usr/local/lib /install/usr/local/bin/wine --version
+
+# ---- 7) give the outputs back to the invoking user ----
+chown -R "$HOST_UID:$HOST_GID" /build /install /opt/mingw-w64
+echo "--- container done $(date -Iseconds) ---"
+echo BUILD_OK
+EOS
+
+rc=$?
+echo "=== docker run rc=$rc ==="
+[ "$rc" -eq 0 ] || { echo "BUILD_FAILED (see the log above)"; exit "$rc"; }
+echo "=== build.sh done; install tree: $INSTALL/usr/local ==="
