@@ -104,7 +104,7 @@ if [ ! -d "$MINGW/src/mingw-w64" ] || [ ! -d "$MINGW/src/binutils" ] \
     [ -s "$MINGW/src/config.guess" ] || { echo "ERROR: cannot fetch config.guess"; exit 1; }
   fi
   echo "=== fetching gcc prerequisites (gmp/mpfr/mpc/isl) on the host ==="
-  local deps=0 i
+  deps=0
   for i in 1 2 3; do
     if ( cd "$MINGW/src/gcc" && ./contrib/download_prerequisites ); then deps=1; break; fi
     echo "gcc prerequisite fetch attempt $i failed; sleeping 30s"
