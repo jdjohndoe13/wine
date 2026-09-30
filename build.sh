@@ -93,7 +93,7 @@ PKGS='gcc g++ make flex bison gettext texinfo gawk pkg-config ccache
       libusb-1.0-0-dev libpcap0.8-dev libv4l-dev libcapi20-dev
       libcups2-dev libgphoto2-dev libkrb5-dev libldap2-dev unixodbc-dev
       libpcsclite-dev
-      ca-certificates git wget xz-utils binutils'
+      curl m4 bzip2 ca-certificates git wget xz-utils binutils'
 if ! apt-get install -y --no-install-recommends $PKGS; then
   echo "batch apt install failed -- retrying package-by-package (optionals may be skipped)"
   for p in $PKGS; do
