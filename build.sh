@@ -188,7 +188,7 @@ echo "--- container start $(date -Iseconds), debian $(cat /etc/debian_version), 
 # work reduced to the wine build itself.
 if [ -f /opt/dwine/prep-done ]; then
   echo "=== pre-built image: deps and cross-toolchain are already present ==="
-
+else
 # ---- 1) Debian 10 is EOL: use the archive, validity checks off ----
 rm -f /etc/apt/sources.list.d/*.list 2>/dev/null || true
 cat > /etc/apt/sources.list <<'SL'
