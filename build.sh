@@ -18,10 +18,12 @@
 #                 toolchain build. Vulkan is disabled (buster's headers are
 #                 too old for wine 10+; Dr.Explain does not use Vulkan).
 #                 Debian 10 is EOL: apt is pointed at archive.debian.org
-#                 with validity checks off. The mingw-w64-build script
-#                 itself is fetched on the HOST (curl --retry) before the
-#                 container starts: transient container-side network errors
-#                 must not abort a 2-3 h build.
+#                 with validity checks off. ALL toolchain resources are
+#                 pre-fetched on the HOST (git/curl are reliable there);
+#                 the container runs the toolchain script with
+#                 --cached-sources and its work area inside the persistent
+#                 bind mount, so transient container-side network failures
+#                 cannot abort the 2-3 h build.
 #
 # Outputs
 #   $BUILD/wine/            out-of-tree build dir
@@ -29,9 +31,9 @@
 #                           (d3-aspkg.sh INST=) at this path
 #
 # Re-entrancy : safe to re-run; wine rebuilds from scratch each time, the
-#               cross-toolchain is kept. Outputs are chown'ed back to the
-#               invoking user at the end (the first run must not leave
-#               root-owned files on the host).
+#               cross-toolchain and its sources are kept. Outputs are
+#               chown'ed back to the invoking user at the end (the first
+#               run must not leave root-owned files on the host).
 #
 # Usage (Linux box with docker, inside a checkout of this repository):
 #   Recommended: run inside screen/tmux so an ssh disconnect cannot
@@ -57,7 +59,11 @@ command -v docker > /dev/null || { echo "ERROR: docker not available on this hos
 mkdir -p "$BUILD" "$INSTALL" "$MINGW"
 rm -rf "$BUILD/wine"
 
-# --- fetch the cross-toolchain build script on the HOST (retries) ---
+# --- HOST-SIDE prefetch of the cross-toolchain script and sources ---
+# The Kron4ek mingw-w64-build script normally downloads everything itself,
+# but in-container TLS transfers proved untrustworthy; git/curl work reliably
+# on the host. Layout expected by the script (--cached-sources):
+#   $MINGW/src/mingw-w64  $MINGW/src/binutils  $MINGW/src/gcc  $MINGW/src/config.guess
 if [ ! -s "$MINGW/mwb.sh" ]; then
   rm -f "$MINGW/mwb.sh"
   echo "=== fetching mingw-w64-build (host side) ==="
@@ -67,6 +73,33 @@ if [ ! -s "$MINGW/mwb.sh" ]; then
   || wget -q https://raw.githubusercontent.com/Kron4ek/Wine-Builds/10.20/mingw-w64-build \
         -O "$MINGW/mwb.sh"
   [ -s "$MINGW/mwb.sh" ] || { echo "ERROR: cannot fetch mingw-w64-build"; exit 1; }
+fi
+
+fetch_git() {
+  local url="$1" branch="$2" dst="$3" i
+  if [ -d "$dst/.git" ]; then echo "    already cached: $dst"; return 0; fi
+  for i in 1 2 3; do
+    git clone --depth 1 -b "$branch" "$url" "$dst" && return 0
+    echo "    clone attempt $i failed, retrying: $url"; rm -rf "$dst" 2>/dev/null || true; sleep 10
+  done
+  echo "ERROR: cannot clone $url"; exit 1
+}
+
+if [ ! -d "$MINGW/src/mingw-w64" ] || [ ! -d "$MINGW/src/binutils" ] \
+   || [ ! -d "$MINGW/src/gcc" ] || [ ! -s "$MINGW/src/config.guess" ]; then
+  echo "=== pre-fetching cross-toolchain sources on the host (retries) ==="
+  mkdir -p "$MINGW/src"
+  fetch_git https://github.com/mingw-w64/mingw-w64.git master "$MINGW/src/mingw-w64"
+  fetch_git https://sourceware.org/git/binutils-gdb.git binutils-2_42-branch "$MINGW/src/binutils"
+  fetch_git https://github.com/gcc-mirror/gcc.git releases/gcc-12 "$MINGW/src/gcc"
+  rm -f "$MINGW/src/config.guess"
+  curl -fsSL --retry 5 \
+    "https://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.guess;hb=HEAD" \
+    -o "$MINGW/src/config.guess" || true
+  [ -s "$MINGW/src/config.guess" ] || { echo "ERROR: cannot fetch config.guess"; exit 1; }
+  echo "=== fetching gcc prerequisites (gmp/mpfr/mpc/isl) on the host ==="
+  ( cd "$MINGW/src/gcc" && ./contrib/download_prerequisites ) \
+    || { echo "ERROR: gcc download_prerequisites failed"; exit 1; }
 fi
 
 echo "=== wine x64-only build in docker ($IMAGE) ==="
@@ -122,13 +155,17 @@ fi
 
 # ---- 3) mingw-w64 cross-toolchain (x86_64), cached across runs ----
 # kron4ek's script requires: g++ flex bison git makeinfo m4 bzip2 curl make diff
-# (all installed above; the script itself is provided from the host.)
-if [ ! -x /opt/mingw-w64/x86_64/bin/x86_64-w64-mingw32-gcc ]; then
+# (all installed above). Sources were pre-fetched on the host; run with
+# --cached-sources. --root keeps src/bld/build.log inside the persistent
+# mount; --prefix installs the cross-compiler into /opt/mingw-w64/bin;
+# --keep-artifacts keeps sources for future runs.
+if [ ! -x /opt/mingw-w64/bin/x86_64-w64-mingw32-gcc ]; then
   echo "=== cross-toolchain not cached yet -- building once (~1 h) ==="
   mkdir -p /opt/_mwb
   cd /opt/_mwb
-  bash /opt/mingw-w64/mwb.sh x86_64 --prefix=/opt/mingw-w64
-  if [ ! -x /opt/mingw-w64/x86_64/bin/x86_64-w64-mingw32-gcc ]; then
+  bash /opt/mingw-w64/mwb.sh --cached-sources --keep-artifacts \
+       --root=/opt/mingw-w64 --prefix=/opt/mingw-w64 x86_64
+  if [ ! -x /opt/mingw-w64/bin/x86_64-w64-mingw32-gcc ]; then
     probe="$(find /opt/mingw-w64 -type f -name x86_64-w64-mingw32-gcc 2>/dev/null | head -1)"
     if [ -z "$probe" ]; then
       echo "ERROR: cross-toolchain was built but the compiler binary was not found"; exit 1
@@ -138,7 +175,7 @@ if [ ! -x /opt/mingw-w64/x86_64/bin/x86_64-w64-mingw32-gcc ]; then
   cd /
   rm -rf /opt/_mwb
 fi
-export PATH="/opt/mingw-w64/x86_64/bin:$PATH"
+export PATH="/opt/mingw-w64/bin:$PATH"
 x86_64-w64-mingw32-gcc --version | head -1
 
 # ---- 4) configure: SINGLE-ARCH x86_64 (plain ./configure = 32-bit build!) ----
