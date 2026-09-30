@@ -98,8 +98,13 @@ if [ ! -d "$MINGW/src/mingw-w64" ] || [ ! -d "$MINGW/src/binutils" ] \
     -o "$MINGW/src/config.guess" || true
   [ -s "$MINGW/src/config.guess" ] || { echo "ERROR: cannot fetch config.guess"; exit 1; }
   echo "=== fetching gcc prerequisites (gmp/mpfr/mpc/isl) on the host ==="
-  ( cd "$MINGW/src/gcc" && ./contrib/download_prerequisites ) \
-    || { echo "ERROR: gcc download_prerequisites failed"; exit 1; }
+  local deps=0 i
+  for i in 1 2 3; do
+    if ( cd "$MINGW/src/gcc" && ./contrib/download_prerequisites ); then deps=1; break; fi
+    echo "gcc prerequisite fetch attempt $i failed; sleeping 30s"
+    sleep 30
+  done
+  [ "$deps" = 1 ] || { echo "ERROR: gcc download_prerequisites failed"; exit 1; }
 fi
 
 echo "=== wine x64-only build in docker ($IMAGE) ==="
