@@ -57,7 +57,14 @@ JOBS="$(nproc)"
 command -v docker > /dev/null || { echo "ERROR: docker not available on this host"; exit 1; }
 
 mkdir -p "$BUILD" "$INSTALL" "$MINGW"
-rm -rf "$BUILD/wine"
+rm -rf "$BUILD/wine" 2>/dev/null || true
+if [ -e "$BUILD/wine" ]; then
+  # previous run died before its chown-back: files are owned by the container
+  # uid, the host cannot remove them -- let the container do it
+  echo "=== pre-clean: stale build dir owned by container uid; cleaning in container ==="
+  docker run --rm -v "$BUILD":/build "$IMAGE" rm -rf /build/wine
+  [ -e "$BUILD/wine" ] && { echo "ERROR: could not clean $BUILD/wine"; exit 1; } || true
+fi
 
 # --- HOST-SIDE prefetch of the cross-toolchain script and sources ---
 # The Kron4ek mingw-w64-build script normally downloads everything itself,
