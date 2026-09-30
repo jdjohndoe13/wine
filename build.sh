@@ -161,17 +161,33 @@ echo "    install: $INSTALL/usr/local"
 echo "    mingw  : $MINGW (persistent cross-toolchain cache)"
 echo "    jobs   : $JOBS"
 
+# Pre-built image mode: WINE_IMAGE may point at an image built from
+# tools/docker/Dockerfile (deps + cross-toolchain baked in, marker file
+# /opt/dwine/prep-done). In that mode the $MINGW bind mount is skipped --
+# mounting it would shadow the baked-in toolchain.
+PREPPED=0
+if docker run --rm "$IMAGE" test -f /opt/dwine/prep-done 2>/dev/null; then
+  PREPPED=1
+  echo "=== image $IMAGE is pre-built: apt + toolchain steps will be skipped ==="
+fi
+
 docker run --rm -i \
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -e HOST_JOBS="$JOBS" \
   -v "$REPO_ROOT":/src \
   -v "$BUILD":/build \
   -v "$INSTALL":/install \
-  -v "$MINGW":/opt/mingw-w64 \
+  $([ "$PREPPED" = 0 ] && echo -v "$MINGW":/opt/mingw-w64) \
   -w /build \
   "$IMAGE" bash -s <<'EOS'
 set -euo pipefail
 trap 'rc=$?; echo "=== CONTAINER_ERROR rc=$rc at $(date -Iseconds) ===" >&2; exit $rc' ERR
 echo "--- container start $(date -Iseconds), debian $(cat /etc/debian_version), uid=$(id -u) ---"
+
+# ---- 1-3) dependency install + mingw-w64 cross-toolchain ----
+# In a pre-built image (tools/docker/Dockerfile) both are baked in and the
+# work reduced to the wine build itself.
+if [ -f /opt/dwine/prep-done ]; then
+  echo "=== pre-built image: deps and cross-toolchain are already present ==="
 
 # ---- 1) Debian 10 is EOL: use the archive, validity checks off ----
 rm -f /etc/apt/sources.list.d/*.list 2>/dev/null || true
@@ -227,6 +243,7 @@ if [ ! -x /opt/mingw-w64/bin/x86_64-w64-mingw32-gcc ]; then
   cd /
   rm -rf /opt/_mwb
 fi
+fi
 export PATH="/opt/mingw-w64/bin:$PATH"
 x86_64-w64-mingw32-gcc --version | head -1
 
@@ -250,7 +267,8 @@ echo "--- wine --version inside this same glibc-2.28 container (no X needed) ---
 LD_LIBRARY_PATH=/install/usr/local/lib /install/usr/local/bin/wine --version
 
 # ---- 7) give the outputs back to the invoking user ----
-chown -R "$HOST_UID:$HOST_GID" /build /install /opt/mingw-w64
+chown -R "$HOST_UID:$HOST_GID" /build /install
+[ -f /opt/dwine/prep-done ] || chown -R "$HOST_UID:$HOST_GID" /opt/mingw-w64
 echo "--- container done $(date -Iseconds) ---"
 echo BUILD_OK
 EOS
