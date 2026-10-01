@@ -1536,6 +1536,7 @@ struct node_get_text_context
     bool first_textual_child;
     bool preserve;
     bool ignored_ws;
+    bool last_text;
     int depth;
 };
 
@@ -1648,10 +1649,19 @@ static void domnode_get_text(const struct domnode *node, struct node_get_text_co
             }
             context->first_textual_child = false;
             context->ignored_ws = false;
+            context->last_text = true;
             break;
 
         case NODE_CDATA_SECTION:
-            string_append(buffer, node->data, SysStringLen(node->data));
+            /* Native MSXML preserves CDATA content verbatim: it is not
+             * subject to the whitespace trimming applied to text node
+             * content, so the trailing trim only fires when the last
+             * non-empty contribution was a text node. */
+            if (SysStringLen(node->data))
+            {
+                string_append(buffer, node->data, SysStringLen(node->data));
+                context->last_text = false;
+            }
             context->first_textual_child = false;
             context->ignored_ws = false;
             break;
@@ -1748,7 +1758,7 @@ HRESULT node_get_text(struct domnode *node, BSTR *text)
             {
                 domnode_get_text(child, &context);
             }
-            if (!context.preserve)
+            if (!context.preserve && context.last_text)
                 domnode_get_text_trim_trailing(&context.buffer);
             return string_to_bstr(&context.buffer, text);
 
@@ -1759,7 +1769,7 @@ HRESULT node_get_text(struct domnode *node, BSTR *text)
 
             context.first_textual_child = true;
             domnode_get_text(node, &context);
-            if (!context.preserve)
+            if (!context.preserve && context.last_text)
                 domnode_get_text_trim_trailing(&context.buffer);
             return string_to_bstr(&context.buffer, text);
 
