@@ -8,6 +8,7 @@ SOURCES = \
 	actxprxy_hlink.idl \
 	actxprxy_htiface.idl \
 	actxprxy_htiframe.idl \
+	actxprxy_mshtml.idl \
 	actxprxy_objsafe.idl \
 	actxprxy_ocmm.idl \
 	actxprxy_servprov.idl \
@@ -16,4 +17,6 @@ SOURCES = \
 	actxprxy_urlhist.idl \
 	usrmarshal.c
 
-dlldata_EXTRADEFS = -DWINE_REGISTER_DLL -DPROXY_DELEGATION
+	dlldata_EXTRADEFS = -DWINE_REGISTER_DLL -DPROXY_DELEGATION
+
+actxprxy_mshtml_EXTRAIDLFLAGS = -DMSHTML_MARSHALING_HACK
