@@ -932,15 +932,41 @@ DISPEX_IDISPATCH_IMPL(HTMLTable, IHTMLTable, impl_from_IHTMLTable(iface)->elemen
 static HRESULT WINAPI HTMLTable_put_cols(IHTMLTable *iface, LONG v)
 {
     HTMLTable *This = impl_from_IHTMLTable(iface);
-    FIXME("(%p)->(%ld)\n", This, v);
-    return E_NOTIMPL;
+    WCHAR buf[64];
+
+    TRACE("(%p)->(%ld)\n", This, v);
+
+    swprintf(buf, ARRAY_SIZE(buf), L"%d", v);
+    return elem_string_attr_setter(&This->element, L"cols", buf);
 }
 
 static HRESULT WINAPI HTMLTable_get_cols(IHTMLTable *iface, LONG *p)
 {
     HTMLTable *This = impl_from_IHTMLTable(iface);
-    FIXME("(%p)->(%p)\n", This, p);
-    return E_NOTIMPL;
+    nsAString val_str;
+    const PRUnichar *val;
+    WCHAR *ptr;
+    nsresult nsres;
+
+    TRACE("(%p)->(%p)\n", This, p);
+
+    *p = 0;
+
+    if(!This->element.dom_element)
+        return S_OK;
+
+    nsres = get_elem_attr_value(This->element.dom_element, L"cols", &val_str, &val);
+    if(NS_FAILED(nsres))
+        return S_OK;
+
+    if(*val) {
+        LONG v = wcstol(val, &ptr, 10);
+        if(ptr != val)
+            *p = v;
+    }
+
+    nsAString_Finish(&val_str);
+    return S_OK;
 }
 
 static HRESULT WINAPI HTMLTable_put_border(IHTMLTable *iface, VARIANT v)
