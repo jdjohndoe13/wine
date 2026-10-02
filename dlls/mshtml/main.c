@@ -352,10 +352,6 @@ static void thread_detach(void)
 {
     thread_data_t *thread_data;
 
-    /* Release the gecko loader owner slot before the thread data can make us
-     * take an early exit below. */
-    forget_gecko_loading_thread();
-
     thread_data = get_thread_data(FALSE);
     if(!thread_data)
         return;
