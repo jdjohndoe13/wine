@@ -1263,7 +1263,6 @@ HRESULT ProtocolFactory_Create(REFCLSID,REFIID,void**);
 
 BOOL load_gecko(void);
 void close_gecko(void);
-void forget_gecko_loading_thread(void);
 void register_nsservice(nsIComponentRegistrar*,nsIServiceManager*);
 void init_nsio(nsIComponentManager*);
 void release_nsio(void);
