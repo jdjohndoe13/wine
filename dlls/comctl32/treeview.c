@@ -2437,8 +2437,9 @@ static void TREEVIEW_DrawItemLineSigns(const TREEVIEW_INFO *infoPtr, HDC hdc,
         int state = (item->state & TVIS_EXPANDED) ? GLPS_OPENED : GLPS_CLOSED;
         RECT glyphRect = item->rect;
 
-        glyphRect.left = item->linesOffset;
-        glyphRect.right = item->stateOffset;
+        glyphRect.left = item->linesOffset - 13;
+        glyphRect.right = item->stateOffset - 13;
+        /* treexpatch v3 2026-10-02 (Dr.Explain C5): shift themed glyph rect LEFT 13px so DrawThemeBackground centers +/- at app expander band center (~7); classic-branch v2 fixes kept for non-themed path */
         DrawThemeBackground(theme, hdc, TVP_GLYPH, state, &glyphRect, NULL);
         return;
     }
@@ -2497,7 +2498,7 @@ static void TREEVIEW_DrawItemLineSigns(const TREEVIEW_INFO *infoPtr, HDC hdc,
 static void
 TREEVIEW_DrawItemLines(const TREEVIEW_INFO *infoPtr, HDC hdc, const TREEVIEW_ITEM *item)
 {
-    LONG centerx, centery;
+    LONG centerx, centery, rectsize;
     BOOL lar = ((infoPtr->dwStyle
 		 & (TVS_LINESATROOT|TVS_HASLINES|TVS_HASBUTTONS))
 		> TVS_LINESATROOT);
@@ -2510,7 +2511,10 @@ TREEVIEW_DrawItemLines(const TREEVIEW_INFO *infoPtr, HDC hdc, const TREEVIEW_ITE
     hbr    = CreateSolidBrush(clrBk);
     hbrOld = SelectObject(hdc, hbr);
 
-    centerx = (item->linesOffset + item->stateOffset) / 2;
+    /* treexpatch v2 2026-10-02 (Dr.Explain C5): drawn center must match app expander band center (~7); user-verified v1 center was ~20 => LEFT-shift 13px */
+    rectsize = min(item->rect.bottom - item->rect.top,
+                   item->stateOffset - item->linesOffset) / 4;
+    centerx = item->linesOffset - rectsize - 12;
     centery = (item->rect.top + item->rect.bottom) / 2;
 
     if (infoPtr->dwStyle & TVS_HASLINES)
