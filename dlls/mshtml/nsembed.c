@@ -780,11 +780,12 @@ static CRITICAL_SECTION_DEBUG cs_load_gecko_dbg =
 };
 static CRITICAL_SECTION cs_load_gecko = { &cs_load_gecko_dbg, -1, 0, 0, 0, 0 };
 
+/* Thread id of the thread that loaded gecko, or 0 if no thread currently owns it. */
+static DWORD loading_thread;
+
 BOOL load_gecko(void)
 {
     BOOL ret = FALSE;
-
-    static DWORD loading_thread;
 
     TRACE("()\n");
 
@@ -803,6 +804,17 @@ BOOL load_gecko(void)
         WCHAR *gecko_path;
 
         loading_thread = GetCurrentThreadId();
+
+        if(pCompMgr) {
+            /* Gecko is already initialized: the thread that loaded it has
+             * exited and forgot the owner, so this thread may adopt the
+             * existing state instead of refusing to run. The owner id is
+             * cleared on thread exit with a plain store, because taking the
+             * critical section inside a thread detach handler can deadlock
+             * against an in-progress load that needs the loader lock. */
+            LeaveCriticalSection(&cs_load_gecko);
+            return TRUE;
+        }
 
         if(!(gecko_path = find_wine_gecko_reg())
            && !(gecko_path = find_wine_gecko_datadir())
@@ -827,6 +839,16 @@ BOOL load_gecko(void)
     LeaveCriticalSection(&cs_load_gecko);
 
     return ret;
+}
+
+void forget_gecko_loading_thread(void)
+{
+    /* The gecko owner thread is exiting, so let the next caller adopt the
+     * already initialized gecko. Not racing with load_gecko here matters
+     * little: the worst case is that the next caller simply refuses to run
+     * or reloads gecko from scratch. */
+    if(loading_thread == GetCurrentThreadId())
+        loading_thread = 0;
 }
 
 void *nsalloc(size_t size)
