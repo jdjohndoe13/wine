@@ -613,7 +613,9 @@ static BOOL load_xul(WCHAR *gecko_path)
 
     len = wcslen(gecko_path);
     wcscpy(gecko_path + len, L"\\xul.dll");
-    xul_handle = LoadLibraryExW(gecko_path, 0, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    /* xul.dll stays loaded across engine restarts, only load it once. */
+    if(!xul_handle)
+        xul_handle = LoadLibraryExW(gecko_path, 0, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     gecko_path[len] = 0;
     if(!xul_handle) {
         WARN("Could not load XUL: %ld\n", GetLastError());
@@ -799,6 +801,60 @@ BOOL load_gecko(void)
 
     EnterCriticalSection(&cs_load_gecko);
 
+    /* A3EXP GECKO RESTART-ON-OWNER-CHANGE */
+
+    /*
+     * Gecko is only usable from one thread: loading_thread above pins the
+     * first caller.  Dr.Explain spawns a fresh export worker per pass, so
+     * pass 2+ lands here after the owner thread exited and was rejected
+     * with CLASS_E_CLASSNOTAVAILABLE (upstream WINE Bug 54071, also seen as
+     * the dom.c test_threads regression).  Keeping the old state alive for
+     * the new thread (adopt-only experiment) hard-hung: XPCOM state stays
+     * tied to the dead owner.  Instead, tear the previous engine instance
+     * down completely and fall through into the normal first-init path
+     * below on this thread.  The same-thread recursion guard above is
+     * untouched, in-session reuse keeps working.  The nsio hook and content
+     * utils statics are re-created by init_xpcom on the fresh init path and
+     * xul.dll itself stays loaded (Gecko doesn't support being unloaded),
+     * so the pointers resolved there remain valid.
+     */
+    if(loading_thread && loading_thread != GetCurrentThreadId()) {
+        TRACE("Owner thread %lx exited, restarting Gecko on thread %lx.\n",
+              (unsigned long)loading_thread, (unsigned long)GetCurrentThreadId());
+
+        release_nsio();
+        init_mutation(NULL);
+
+        if(cat_mgr) {
+            nsICategoryManager_Release(cat_mgr);
+            cat_mgr = NULL;
+        }
+
+        if(profile_directory) {
+            nsIFile_Release(profile_directory);
+            profile_directory = NULL;
+        }
+
+        if(plugin_directory) {
+            nsIFile_Release(plugin_directory);
+            plugin_directory = NULL;
+        }
+
+        if(pCompMgr) {
+            nsIComponentManager_Release(pCompMgr);
+            pCompMgr = NULL;
+        }
+
+        if(pServMgr) {
+            nsresult nsres = NS_ShutdownXPCOM(pServMgr);
+            if(NS_FAILED(nsres))
+                WARN("NS_ShutdownXPCOM failed: %08lx\n", nsres);
+            pServMgr = NULL;
+        }
+
+        loading_thread = 0;
+    }
+
     if(!loading_thread) {
         WCHAR *gecko_path;
 
@@ -820,6 +876,8 @@ BOOL load_gecko(void)
            MESSAGE("Could not find Wine Gecko. HTML rendering will be disabled.\n");
         }
     }else {
+        /* Defensive, normally unreachable: foreign threads restart above
+         * and same-thread callers return in the recursion guard. */
         FIXME("Gecko can only be used from one thread.\n");
         ret = FALSE;
     }
