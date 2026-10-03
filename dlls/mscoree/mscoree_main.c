@@ -758,6 +758,30 @@ static int compare_versions(const char *a, const char *b)
     return 0;
 }
 
+static BOOL mono_installer_disabled(void)
+{
+    /* opt-in kill switch for the Wine Mono installer modal (per-prefix):
+       HKCU\Software\Wine\Mono, value InstallerDisabled (REG_DWORD, nonzero).
+       Without the key the upstream behavior (install dialog) is unchanged. */
+    static const WCHAR mono_key[] = {'S','o','f','t','w','a','r','e','\\','W','i','n','e','\\','M','o','n','o',0};
+    static const WCHAR installer_disabled[] = {'I','n','s','t','a','l','l','e','r','D','i','s','a','b','l','e','d',0};
+
+    DWORD type, value = 0, size = sizeof(value);
+    HKEY key;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, mono_key, 0, KEY_READ, &key))
+        return FALSE;
+
+    if (RegQueryValueExW(key, installer_disabled, 0, &type, (LPBYTE)&value, &size) != ERROR_SUCCESS ||
+        type != REG_DWORD || !value)
+    {
+        RegCloseKey(key);
+        return FALSE;
+    }
+    RegCloseKey(key);
+    return TRUE;
+}
+
 static BOOL invoke_appwiz(void)
 {
     PROCESS_INFORMATION pi;
@@ -874,6 +898,13 @@ static BOOL install_wine_mono(void)
     if (!get_mono_path(mono_path, FALSE))
     {
         TRACE("mono runtime not found\n");
+
+        if (mono_installer_disabled())
+        {
+            FIXME("SilentNoDotNetDisabled: skipping Wine Mono installer dialog\n");
+            return FALSE;
+        }
+
         return invoke_appwiz();
     }
 
