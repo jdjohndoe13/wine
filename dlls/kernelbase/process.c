@@ -933,7 +933,12 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetProcessId( HANDLE process )
 BOOL WINAPI /* DECLSPEC_HOTPATCH */ GetProcessMitigationPolicy( HANDLE process, PROCESS_MITIGATION_POLICY policy,
                                                           void *buffer, SIZE_T length )
 {
-    FIXME( "(%p, %u, %p, %Iu): stub\n", process, policy, buffer, length );
+    FIXME( "(%p, %u, %p, %Iu): zero-fill\n", process, policy, buffer, length );
+    /* wine has no mitigation policies in force; report the Windows default
+       (all off) instead of leaving the caller's buffer untouched — a garbage
+       read here used to raise fail-fast (0x80000003) in chromium subprocesses
+       (see wine bug 59529). */
+    if (buffer && length) memset( buffer, 0, length );
     return TRUE;
 }
 
