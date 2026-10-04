@@ -2089,17 +2089,17 @@ static HRESULT WINAPI dwritefontface_reference_CreateFontFaceWithSimulations(IDW
 
     TRACE("%p, %#x, %p.\n", iface, simulations, ret);
 
-    hr = IDWriteFontFile_Analyze(fontface->file, &is_supported, &file_type, &face_type, &face_num);
-    if (FAILED(hr))
-        return hr;
+    if (FAILED(hr = IDWriteFontFile_Analyze(fontface->file, &is_supported, &file_type, &face_type, &face_num)))
+        return dwrite_get_default_fontface(fontface->factory, &IID_IDWriteFontFace3, (void **)ret);
 
-    hr = IDWriteFactory7_CreateFontFace(fontface->factory, face_type, 1, &fontface->file, fontface->index,
-            simulations, &face);
-    if (SUCCEEDED(hr))
+    if (FAILED(hr = IDWriteFactory7_CreateFontFace(fontface->factory, face_type, 1, &fontface->file, fontface->index,
+            simulations, &face)))
     {
-        hr = IDWriteFontFace_QueryInterface(face, &IID_IDWriteFontFace3, (void **)ret);
-        IDWriteFontFace_Release(face);
+        return dwrite_get_default_fontface(fontface->factory, &IID_IDWriteFontFace3, (void **)ret);
     }
+
+    hr = IDWriteFontFace_QueryInterface(face, &IID_IDWriteFontFace3, (void **)ret);
+    IDWriteFontFace_Release(face);
 
     return hr;
 }
@@ -2247,6 +2247,7 @@ static HRESULT get_fontface_from_font(struct dwrite_font *font, IDWriteFontFace5
     hr = create_fontface(&desc, cached_list, fontface);
 
     IDWriteFontFileStream_Release(desc.stream);
+
     return hr;
 }
 
@@ -2407,13 +2408,22 @@ static HRESULT WINAPI dwritefont_HasCharacter(IDWriteFont3 *iface, UINT32 ch, BO
     return S_OK;
 }
 
+static HRESULT dwritefont_nevernull_fontface(const struct dwrite_font *font, REFIID riid, void **obj)
+{
+    return dwrite_get_default_fontface(font->family->collection->factory, riid, obj);
+}
+
 static HRESULT WINAPI dwritefont_CreateFontFace(IDWriteFont3 *iface, IDWriteFontFace **fontface)
 {
     struct dwrite_font *font = impl_from_IDWriteFont3(iface);
+    HRESULT hr;
 
     TRACE("%p, %p.\n", iface, fontface);
 
-    return get_fontface_from_font(font, (IDWriteFontFace5 **)fontface);
+    if (FAILED(hr = get_fontface_from_font(font, (IDWriteFontFace5 **)fontface)))
+        return dwritefont_nevernull_fontface(font, &IID_IDWriteFontFace, (void **)fontface);
+
+    return hr;
 }
 
 static void WINAPI dwritefont1_GetMetrics(IDWriteFont3 *iface, DWRITE_FONT_METRICS1 *metrics)
@@ -2470,10 +2480,14 @@ static BOOL WINAPI dwritefont2_IsColorFont(IDWriteFont3 *iface)
 static HRESULT WINAPI dwritefont3_CreateFontFace(IDWriteFont3 *iface, IDWriteFontFace3 **fontface)
 {
     struct dwrite_font *font = impl_from_IDWriteFont3(iface);
+    HRESULT hr;
 
     TRACE("%p, %p.\n", iface, fontface);
 
-    return get_fontface_from_font(font, (IDWriteFontFace5 **)fontface);
+    if (FAILED(hr = get_fontface_from_font(font, (IDWriteFontFace5 **)fontface)))
+        return dwritefont_nevernull_fontface(font, &IID_IDWriteFontFace3, (void **)fontface);
+
+    return hr;
 }
 
 static BOOL WINAPI dwritefont3_Equals(IDWriteFont3 *iface, IDWriteFont *other)
@@ -2870,21 +2884,27 @@ static UINT32 WINAPI dwritefontfamily_GetFontCount(IDWriteFontFamily2 *iface)
 static HRESULT WINAPI dwritefontfamily_GetFont(IDWriteFontFamily2 *iface, UINT32 index, IDWriteFont **font)
 {
     struct dwrite_fontfamily *family = impl_from_IDWriteFontFamily2(iface);
+    HRESULT hr;
 
     TRACE("%p, %u, %p.\n", iface, index, font);
 
     *font = NULL;
 
-    /* An empty family has no font a caller could resolve a face from.  Return a failure
-       instead of a success status paired with a NULL font, so callers skip this family
-       or its font instead of passing a NULL carrier forward. */
+    /* An empty family (a family that carries no loadable font, or whose family was detached
+       mid-flight) has no font of its own to resolve to.  Hand the pinned default font out
+       instead of failing the call, so the caller's out-param is never left NULL: a failed call
+       still leaves the out-param NULL, and that NULL carrier is what callers that don't check
+       the status trip over.  Windows-compatible parameter errors keep failing. */
     if (!family->data->count)
-        return DWRITE_E_NOFONT;
+        return dwrite_get_default_font(family->collection->factory, &IID_IDWriteFont, (void **)font);
 
     if (index >= family->data->count)
         return E_INVALIDARG;
 
-    return create_font(family, index, (IDWriteFont3 **)font);
+    if (FAILED(hr = create_font(family, index, (IDWriteFont3 **)font)))
+        return dwrite_get_default_font(family->collection->factory, &IID_IDWriteFont, (void **)font);
+
+    return hr;
 }
 
 static HRESULT WINAPI dwritefontfamily_GetFamilyNames(IDWriteFontFamily2 *iface, IDWriteLocalizedStrings **names)
@@ -2949,7 +2969,7 @@ static HRESULT WINAPI dwritefontfamily_GetFirstMatchingFont(IDWriteFontFamily2 *
     if (!family->data->count)
     {
         *font = NULL;
-        return DWRITE_E_NOFONT;
+        return dwrite_get_default_font(family->collection->factory, &IID_IDWriteFont, (void **)font);
     }
 
     init_font_prop_vec(weight, stretch, style, &req);
@@ -3073,20 +3093,24 @@ static DWRITE_LOCALITY WINAPI dwritefontfamily1_GetFontLocality(IDWriteFontFamil
 static HRESULT WINAPI dwritefontfamily1_GetFont(IDWriteFontFamily2 *iface, UINT32 index, IDWriteFont3 **font)
 {
     struct dwrite_fontfamily *family = impl_from_IDWriteFontFamily2(iface);
+    HRESULT hr;
 
     TRACE("%p, %u, %p.\n", iface, index, font);
 
     *font = NULL;
 
-    /* Same as IDWriteFontFamily::GetFont(): empty families fail the handout instead of
-       a success status with a NULL font. */
+    /* Same as IDWriteFontFamily::GetFont(): an empty family hands the pinned default font
+       out instead of leaving a NULL out-param behind. */
     if (!family->data->count)
-        return DWRITE_E_NOFONT;
+        return dwrite_get_default_font(family->collection->factory, &IID_IDWriteFont3, (void **)font);
 
     if (index >= family->data->count)
         return E_FAIL;
 
-    return create_font(family, index, font);
+    if (FAILED(hr = create_font(family, index, font)))
+        return dwrite_get_default_font(family->collection->factory, &IID_IDWriteFont3, (void **)font);
+
+    return hr;
 }
 
 static HRESULT WINAPI dwritefontfamily1_GetFontFaceReference(IDWriteFontFamily2 *iface, UINT32 index,
@@ -3094,6 +3118,7 @@ static HRESULT WINAPI dwritefontfamily1_GetFontFaceReference(IDWriteFontFamily2 
 {
     struct dwrite_fontfamily *family = impl_from_IDWriteFontFamily2(iface);
     const struct dwrite_font_data *font;
+    HRESULT hr;
 
     TRACE("%p, %u, %p.\n", iface, index, reference);
 
@@ -3103,8 +3128,16 @@ static HRESULT WINAPI dwritefontfamily1_GetFontFaceReference(IDWriteFontFamily2 
         return E_FAIL;
 
     font = family->data->fonts[index];
-    return IDWriteFactory5_CreateFontFaceReference_((IDWriteFactory5 *)family->collection->factory,
-            font->file, font->face_index, font->simulations, reference);
+    if (FAILED(hr = IDWriteFactory5_CreateFontFaceReference_((IDWriteFactory5 *)family->collection->factory,
+            font->file, font->face_index, font->simulations, reference)))
+    {
+        /* The family's face couldn't be referenced: hand the pinned default font face
+           reference out instead of leaving a NULL out-param behind. */
+        return dwrite_get_default_fontface(family->collection->factory, &IID_IDWriteFontFaceReference,
+                (void **)reference);
+    }
+
+    return hr;
 }
 
 static HRESULT WINAPI dwritefontfamily2_GetMatchingFonts(IDWriteFontFamily2 *iface,
@@ -3323,10 +3356,12 @@ static HRESULT WINAPI dwritefontcollection_GetFontFamily(IDWriteFontCollection3 
     if (index >= collection->count)
         return E_FAIL;
 
-    if (SUCCEEDED(hr = create_fontfamily(collection, index, &family)))
-        *ret = (IDWriteFontFamily *)&family->IDWriteFontFamily2_iface;
+    if (FAILED(hr = create_fontfamily(collection, index, &family)))
+        return dwrite_get_default_fontfamily(collection->factory, &IID_IDWriteFontFamily, (void **)ret);
 
-    return hr;
+    *ret = (IDWriteFontFamily *)&family->IDWriteFontFamily2_iface;
+
+    return S_OK;
 }
 
 static UINT32 collection_find_family(struct dwrite_fontcollection *collection, const WCHAR *name)
@@ -3382,9 +3417,11 @@ static HRESULT WINAPI dwritefontcollection_GetFontFromFontFace(IDWriteFontCollec
         return E_INVALIDARG;
 
     count = 1;
-    hr = IDWriteFontFace_GetFiles(face, &count, &file);
-    if (FAILED(hr))
-        return hr;
+    if (FAILED(hr = IDWriteFontFace_GetFiles(face, &count, &file)))
+    {
+        WARN("Failed to get font face files, hr %#lx.\n", hr);
+        return dwrite_get_default_font(collection->factory, &IID_IDWriteFont, (void **)font);
+    }
     face_index = IDWriteFontFace_GetIndex(face);
 
     found_font = FALSE;
@@ -3407,15 +3444,19 @@ static HRESULT WINAPI dwritefontcollection_GetFontFromFontFace(IDWriteFontCollec
     }
     IDWriteFontFile_Release(file);
 
+    /* An unlisted face is resolved to the pinned default font: the caller's out-param is never
+       left NULL, whether the collection failed to match the face or the resolution itself
+       failed. */
     if (!found_font)
-        return DWRITE_E_NOFONT;
+        return dwrite_get_default_font(collection->factory, &IID_IDWriteFont, (void **)font);
 
-    hr = create_fontfamily(collection, i, &family);
-    if (FAILED(hr))
-        return hr;
+    if (FAILED(hr = create_fontfamily(collection, i, &family)))
+        return dwrite_get_default_font(collection->factory, &IID_IDWriteFont, (void **)font);
 
-    hr = create_font(family, j, (IDWriteFont3 **)font);
+    if (FAILED(hr = create_font(family, j, (IDWriteFont3 **)font)))
+        return dwrite_get_default_font(collection->factory, &IID_IDWriteFont, (void **)font);
     IDWriteFontFamily2_Release(&family->IDWriteFontFamily2_iface);
+
     return hr;
 }
 
@@ -4910,6 +4951,147 @@ HRESULT get_system_fontcollection(IDWriteFactory7 *factory, DWRITE_FONT_FAMILY_M
     }
 
     return hr;
+}
+
+/* Process-wide pinned default font used by font resolution routes: whenever a requested family,
+   face or font can't be resolved, routes hand this object out with S_OK instead of leaving a
+   NULL out-param behind.  A failed call paired with a NULL out-param is what passes the NULL
+   carrier on to callers that don't check the status; "no font" resolves to the default font
+   instead.  The default font is created lazily as the first face of the wine default system
+   family (Segoe UI), or the lowest-index family when it's absent, and pinned for the process
+   lifetime by never releasing the references: the font references its family, the family
+   references the collection, and the collection references the originating factory, so engine
+   teardown bursts cannot dispose of the default under a caller's feet. */
+static const WCHAR default_font_family_name[] = L"Segoe UI";
+static INIT_ONCE init_default_font_once = INIT_ONCE_STATIC_INIT;
+static struct dwrite_fontfamily *default_fontfamily; /* pinned for the process lifetime */
+static struct dwrite_font *default_font;             /* pinned for the process lifetime */
+
+static BOOL default_font_from_family(struct dwrite_fontcollection *collection, UINT32 index,
+        struct dwrite_fontfamily **out_family, IDWriteFont3 **out_font)
+{
+    struct dwrite_fontfamily *family;
+    IDWriteFont3 *font;
+
+    if (FAILED(create_fontfamily(collection, index, &family)))
+        return FALSE;
+
+    if (!family->data->count || FAILED(create_font(family, 0, &font)))
+    {
+        IDWriteFontFamily2_Release(&family->IDWriteFontFamily2_iface);
+        return FALSE;
+    }
+
+    *out_family = family;
+    *out_font = font;
+    return TRUE;
+}
+
+/* Particular factory instance used for the initial build is not important: the pin keeps it
+   alive for the process lifetime. */
+static BOOL WINAPI default_font_initonce(INIT_ONCE *once, void *param, void **context)
+{
+    struct dwrite_fontcollection *collection;
+    struct dwrite_fontfamily *family = NULL;
+    IDWriteFontCollection3 *collection3;
+    IDWriteFont3 *font = NULL;
+    BOOL exists = FALSE, found = FALSE;
+    UINT32 index, i;
+    HRESULT hr;
+
+    if (FAILED(hr = get_system_fontcollection(param, DWRITE_FONT_FAMILY_MODEL_TYPOGRAPHIC,
+            (IDWriteFontCollection **)&collection3)))
+    {
+        WARN("Failed to get system font collection, hr %#lx.\n", hr);
+        return FALSE;
+    }
+
+    collection = impl_from_IDWriteFontCollection3(collection3);
+
+    if (SUCCEEDED(IDWriteFontCollection3_FindFamilyName(collection3, default_font_family_name, &index, &exists)) && exists)
+        found = default_font_from_family(collection, index, &family, &font);
+
+    for (i = 0; !found && i < collection->count; ++i)
+        found = default_font_from_family(collection, i, &family, &font);
+
+    IDWriteFontCollection3_Release(collection3);
+
+    if (!found)
+    {
+        WARN("No family with a loadable font found for the default font.\n");
+        return FALSE;
+    }
+
+    /* Pin: these references are kept for the process lifetime, never released. */
+    default_fontfamily = family;
+    default_font = impl_from_IDWriteFont3(font);
+
+    return TRUE;
+}
+
+static HRESULT default_font_pin(IDWriteFactory7 *factory)
+{
+    if (!InitOnceExecuteOnce(&init_default_font_once, default_font_initonce, factory, NULL))
+    {
+        WARN("Failed to pin the default font.\n");
+        return DWRITE_E_NOFONT;
+    }
+
+    return S_OK;
+}
+
+HRESULT dwrite_get_default_font(IDWriteFactory7 *factory, REFIID riid, void **obj)
+{
+    HRESULT hr;
+
+    if (FAILED(hr = default_font_pin(factory)))
+        return hr;
+
+    return IDWriteFont3_QueryInterface(&default_font->IDWriteFont3_iface, riid, obj);
+}
+
+HRESULT dwrite_get_default_fontfamily(IDWriteFactory7 *factory, REFIID riid, void **obj)
+{
+    HRESULT hr;
+
+    if (FAILED(hr = default_font_pin(factory)))
+        return hr;
+
+    return IDWriteFontFamily2_QueryInterface(&default_fontfamily->IDWriteFontFamily2_iface, riid, obj);
+}
+
+static INIT_ONCE init_default_fontface_once = INIT_ONCE_STATIC_INIT;
+static struct dwrite_fontface *default_fontface; /* pinned for the process lifetime */
+
+static BOOL WINAPI default_fontface_initonce(INIT_ONCE *once, void *param, void **context)
+{
+    IDWriteFontFace5 *fontface5;
+    HRESULT hr;
+
+    if (FAILED(hr = get_fontface_from_font(default_font, &fontface5)))
+    {
+        WARN("Failed to create the default font face, hr %#lx.\n", hr);
+        return FALSE;
+    }
+
+    default_fontface = impl_from_IDWriteFontFace5(fontface5);
+    return TRUE;
+}
+
+HRESULT dwrite_get_default_fontface(IDWriteFactory7 *factory, REFIID riid, void **obj)
+{
+    HRESULT hr;
+
+    if (FAILED(hr = default_font_pin(factory)))
+        return hr;
+
+    if (!InitOnceExecuteOnce(&init_default_fontface_once, default_fontface_initonce, factory, NULL))
+    {
+        WARN("Failed to pin the default font face.\n");
+        return DWRITE_E_NOFONT;
+    }
+
+    return IDWriteFontFace5_QueryInterface(&default_fontface->IDWriteFontFace5_iface, riid, obj);
 }
 
 static HRESULT eudc_collection_add_family(IDWriteFactory7 *factory, struct dwrite_fontcollection *collection,
@@ -6660,17 +6842,17 @@ static HRESULT WINAPI fontfacereference_CreateFontFaceWithSimulations(IDWriteFon
 
     TRACE("%p, %#x, %p.\n", iface, simulations, ret);
 
-    hr = IDWriteFontFile_Analyze(reference->file, &is_supported, &file_type, &face_type, &face_num);
-    if (FAILED(hr))
-        return hr;
+    if (FAILED(hr = IDWriteFontFile_Analyze(reference->file, &is_supported, &file_type, &face_type, &face_num)))
+        return dwrite_get_default_fontface(reference->factory, &IID_IDWriteFontFace3, (void **)ret);
 
-    hr = IDWriteFactory7_CreateFontFace(reference->factory, face_type, 1, &reference->file, reference->index,
-            simulations, &fontface);
-    if (SUCCEEDED(hr))
+    if (FAILED(hr = IDWriteFactory7_CreateFontFace(reference->factory, face_type, 1, &reference->file, reference->index,
+            simulations, &fontface)))
     {
-        hr = IDWriteFontFace_QueryInterface(fontface, &IID_IDWriteFontFace3, (void **)ret);
-        IDWriteFontFace_Release(fontface);
+        return dwrite_get_default_fontface(reference->factory, &IID_IDWriteFontFace3, (void **)ret);
     }
+
+    hr = IDWriteFontFace_QueryInterface(fontface, &IID_IDWriteFontFace3, (void **)ret);
+    IDWriteFontFace_Release(fontface);
 
     return hr;
 }
@@ -6810,6 +6992,9 @@ static HRESULT WINAPI fontfacereference1_CreateFontFace(IDWriteFontFaceReference
         hr = IDWriteFontFace3_QueryInterface(fontface3, &IID_IDWriteFontFace5, (void **)fontface);
         IDWriteFontFace3_Release(fontface3);
     }
+
+    if (FAILED(hr))
+        return dwrite_get_default_fontface(reference->factory, &IID_IDWriteFontFace5, (void **)fontface);
 
     return hr;
 }
