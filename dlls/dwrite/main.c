@@ -724,26 +724,31 @@ static struct collectionloader *factory_get_collection_loader(struct dwritefacto
     return found;
 }
 
-/* Fetch a cached system collection: the cached slot may be cleared concurrently
+/* Fetch a collection from a cached slot: the slot may be cleared concurrently
    (factory_detach_fontcollection(), factory teardown), so read it atomically, pin the
    instance, and verify the slot still holds that same instance before handing it out. */
-static IDWriteFontCollection *factory_fetch_cached_collection(struct dwritefactory *factory,
-        DWRITE_FONT_FAMILY_MODEL family_model)
+static IDWriteFontCollection *factory_fetch_cached_slot(IDWriteFontCollection3 **slot)
 {
-    IDWriteFontCollection *collection;
+    IDWriteFontCollection3 *instance;
 
-    if (!(collection = InterlockedCompareExchangePointer((void **)&factory->system_collections[family_model], NULL, NULL)))
+    if (!(instance = InterlockedCompareExchangePointer((void **)slot, NULL, NULL)))
         return NULL;
 
-    IDWriteFontCollection_AddRef(collection);
+    IDWriteFontCollection3_AddRef(instance);
 
-    if (InterlockedCompareExchangePointer((void **)&factory->system_collections[family_model], collection, collection) == collection)
-        return collection;
+    if (InterlockedCompareExchangePointer((void **)slot, instance, instance) == instance)
+        return (IDWriteFontCollection *)instance;
 
     /* The instance was detached concurrently; the pin just taken keeps it alive
        while the reference is dropped. */
-    IDWriteFontCollection_Release(collection);
+    IDWriteFontCollection3_Release(instance);
     return NULL;
+}
+
+static IDWriteFontCollection *factory_fetch_cached_collection(struct dwritefactory *factory,
+        DWRITE_FONT_FAMILY_MODEL family_model)
+{
+    return factory_fetch_cached_slot(&factory->system_collections[family_model]);
 }
 
 static HRESULT factory_get_system_collection(struct dwritefactory *factory,
@@ -1377,17 +1382,27 @@ static HRESULT WINAPI dwritefactory1_GetEudcFontCollection(IDWriteFactory7 *ifac
     BOOL check_for_updates)
 {
     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
-    HRESULT hr = S_OK;
+    IDWriteFontCollection *fetched;
+    IDWriteFontCollection3 *eudc_collection;
+    unsigned int attempt;
+    HRESULT hr;
 
     TRACE("%p, %p, %d.\n", iface, collection, check_for_updates);
 
     if (check_for_updates)
         FIXME("checking for eudc updates not implemented\n");
 
-    if (factory->eudc_collection)
-        IDWriteFontCollection1_AddRef(factory->eudc_collection);
-    else {
-        IDWriteFontCollection3 *eudc_collection;
+    /* Two attempts: same handout discipline as the cached system collection slots, since
+       a freshly stored cache entry can still be detached (collection released) before the
+       handout, and a truncated handout would surface a family that resolves to nothing. */
+    for (attempt = 0; attempt < 2; ++attempt)
+    {
+        if ((fetched = factory_fetch_cached_slot((IDWriteFontCollection3 **)&factory->eudc_collection)))
+        {
+            hr = IDWriteFontCollection_QueryInterface(fetched, &IID_IDWriteFontCollection, (void **)collection);
+            IDWriteFontCollection_Release(fetched);
+            return hr;
+        }
 
         if (FAILED(hr = get_eudc_fontcollection(iface, &eudc_collection)))
         {
@@ -1400,9 +1415,7 @@ static HRESULT WINAPI dwritefactory1_GetEudcFontCollection(IDWriteFactory7 *ifac
             IDWriteFontCollection3_Release(eudc_collection);
     }
 
-    *collection = (IDWriteFontCollection *)factory->eudc_collection;
-
-    return hr;
+    return E_FAIL;
 }
 
 static HRESULT WINAPI dwritefactory1_CreateCustomRenderingParams(IDWriteFactory7 *iface, FLOAT gamma,
