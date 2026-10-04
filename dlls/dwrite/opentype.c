@@ -1587,6 +1587,38 @@ static HRESULT opentype_type1_analyzer(IDWriteFontFileStream *stream, UINT32 *fo
     return *file_type != DWRITE_FONT_FILE_TYPE_UNKNOWN ? S_OK : S_FALSE;
 }
 
+/* Web font containers a browser layer stages through dwrite: dwrite has no WOFF/WOFF2
+   container unpacking itself (see the IDWriteFactory5::UnpackFontFile stub), so without
+   an accepting analyzer a valid container would be reported unsupported at the stream
+   route and never materialize a face. Accept it as a truetype face instead; per-table
+   stream reads degrade to their defaults on the compressed bytes, while glyphs ingest
+   through the ft backend (dwrite_fontface_get_font_object reads the raw blob through
+   the same ingestion the system faces resolve on, with the default face pin keeping a
+   failed backend carrier resolved). */
+static HRESULT opentype_webfont_analyzer(IDWriteFontFileStream *stream, UINT32 *font_count, DWRITE_FONT_FILE_TYPE *file_type,
+    DWRITE_FONT_FACE_TYPE *face_type)
+{
+    const DWORD *header;
+    void *context;
+    HRESULT hr;
+
+    hr = IDWriteFontFileStream_ReadFileFragment(stream, (const void **)&header, 0, sizeof(*header), &context);
+    if (FAILED(hr))
+        return hr;
+
+    if (*header == MS_WOFF_TAG || *header == MS_WOF2_TAG)
+    {
+        *font_count = 1;
+        *file_type = DWRITE_FONT_FILE_TYPE_TRUETYPE;
+        *face_type = DWRITE_FONT_FACE_TYPE_TRUETYPE;
+        TRACE("WOFF/WOFF2 container accepted, ingested through the ft backend.\n");
+    }
+
+    IDWriteFontFileStream_ReleaseFileFragment(stream, context);
+
+    return *file_type != DWRITE_FONT_FILE_TYPE_UNKNOWN ? S_OK : S_FALSE;
+}
+
 HRESULT opentype_analyze_font(IDWriteFontFileStream *stream, BOOL *supported, DWRITE_FONT_FILE_TYPE *file_type,
         DWRITE_FONT_FACE_TYPE *face_type, UINT32 *face_count)
 {
@@ -1595,6 +1627,7 @@ HRESULT opentype_analyze_font(IDWriteFontFileStream *stream, BOOL *supported, DW
         opentype_otf_analyzer,
         opentype_ttc_analyzer,
         opentype_type1_analyzer,
+        opentype_webfont_analyzer,
         NULL
     };
     dwrite_fontfile_analyzer *analyzer = fontfile_analyzers;
