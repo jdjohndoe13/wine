@@ -4421,6 +4421,82 @@ static void get_nearest_charset( const WCHAR *family_name, struct gdi_font_face 
     csi->ciCharset = DEFAULT_CHARSET;
 }
 
+/* the process pinned resident default font object.  Materialized once from a
+   loadable face of the "System" family or a default UI family; select routes
+   that cannot resolve a LOGFONT hand it out instead of leaving the caller a
+   null carrier.  The handout keeps it out of the cache LRU: the alloc
+   reference on the object is never released, so it can never enter the
+   unused list or be freed. */
+static struct gdi_font *pinned_default_font;
+
+static const WCHAR pinned_default_system_nameW[] = {'S','y','s','t','e','m',0};
+static const WCHAR *pinned_default_names[] =
+{
+    pinned_default_system_nameW, tahomaW, microsoft_sans_serifW,
+};
+
+static struct gdi_font *create_pinned_default_font_from_family( struct gdi_font_family *family,
+                                                                const LOGFONTW *lf )
+{
+    FONTSIGNATURE fs = {{0}};
+    struct gdi_font_face *face;
+    struct gdi_font *font;
+    CHARSETINFO csi;
+
+    if (!(face = find_best_matching_face( family, lf, fs, TRUE )))
+    {
+        if (list_empty( &family->faces )) return NULL;
+        face = LIST_ENTRY( list_head( &family->faces ), struct gdi_font_face, entry );
+    }
+
+    if (!(font = create_gdi_font( face, NULL, lf ))) return NULL;
+    if (!font_funcs->load_font( font ))
+    {
+        /* a face whose ft carrier failed to build is dropped, not handed out */
+        free_gdi_font( font );
+        return NULL;
+    }
+    csi.fs.fsCsb[0] = 0;
+    get_nearest_charset( face->family->family_name, face, &csi );
+    font->charset = csi.ciCharset;
+    font->codepage = csi.ciACP;
+    return font;
+}
+
+/* hand the pinned default font out with a reference; the caller must hold font_lock */
+static struct gdi_font *get_pinned_default_font( void )
+{
+    struct gdi_font_family *family;
+    struct gdi_font *font;
+    LOGFONTW lf = { .lfHeight = -12, .lfCharSet = DEFAULT_CHARSET,
+                    .lfPitchAndFamily = DEFAULT_PITCH };
+    unsigned int i;
+
+    if (pinned_default_font)
+    {
+        pinned_default_font->refcount++;
+        return pinned_default_font;
+    }
+
+    for (i = 0; i < ARRAY_SIZE( pinned_default_names ); i++)
+    {
+        if (!(family = find_family_from_any_name( pinned_default_names[i] ))) continue;
+        if ((font = create_pinned_default_font_from_family( family, &lf ))) goto found;
+    }
+    /* otherwise resolve a valid low-index family's face from the font list */
+    WINE_RB_FOR_EACH_ENTRY( family, &family_name_tree, struct gdi_font_family, name_entry )
+        if ((font = create_pinned_default_font_from_family( family, &lf ))) goto found;
+
+    WARN( "no loadable face for the pinned default font\n" );
+    return NULL;
+
+found:
+    pinned_default_font = font;  /* keep the object for the process lifetime */
+    font->refcount++;            /* handout reference; the alloc reference is the pin */
+    TRACE( "pinned default font %p\n", font );
+    return font;
+}
+
 static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bitmap )
 {
     struct gdi_font *font;
@@ -4446,8 +4522,14 @@ static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bit
     }
     if (!(face = find_matching_face( lf, &csi, can_use_bitmap, &substituted, &orig_name )))
     {
-        FIXME( "can't find a single appropriate font - bailing\n" );
-        return NULL;
+        /* A LOGFONT lookup that cannot resolve to a face is not allowed to
+           hand a null font out of the cache path: the caller's SelectFont
+           contract gets back a valid object, so resolve to the pinned default
+           font instead.  (Only an entirely empty font store can still hand a
+           null out - there is no font object to hand out in that state.) */
+        WARN( "can't find a single appropriate font - resolving %s to the pinned default font\n",
+              debugstr_w(lf->lfFaceName) );
+        return get_pinned_default_font();
     }
     height = lf->lfHeight;
 
@@ -4504,8 +4586,11 @@ static struct gdi_font *select_font( LOGFONTW *lf, FMAT2 dcmat, BOOL can_use_bit
 
     if (!font_funcs->load_font( font ))
     {
+        /* A face whose ft carrier failed to build is dropped instead of
+           handed out - the select route resolves to the pinned default font
+           the same way the face-lookup route does. */
         free_gdi_font( font );
-        return NULL;
+        return get_pinned_default_font();
     }
 
     if (face->flags & ADDFONT_VERTICAL_FONT) /* We need to try to load the GSUB table */
