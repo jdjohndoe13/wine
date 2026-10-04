@@ -635,10 +635,19 @@ static void release_fontface_cache(struct list *fontfaces)
     }
 }
 
-static void release_fileloader(struct fileloader *fileloader)
+static void release_fileloader(struct dwritefactory *factory, struct fileloader *fileloader)
 {
+    /* The loader's cached face slots are detached under the factory critical section, the
+       same section face resolution routes hold while searching the slots for an already
+       built family face: an unlocked detach would leave a route iterating a dead list of
+       wrappers, handing the dead carrier out at resolution time. */
+    factory_lock(&factory->IDWriteFactory7_iface);
     list_remove(&fileloader->entry);
     release_fontface_cache(&fileloader->fontfaces);
+    factory_unlock(&factory->IDWriteFactory7_iface);
+
+    /* The loader instance itself is released outside the section: some loader instances
+       release back into the factory. */
     IDWriteFontFileLoader_Release(fileloader->loader);
     free(fileloader);
 }
@@ -669,7 +678,7 @@ static void release_dwritefactory(struct dwritefactory *factory)
     }
 
     LIST_FOR_EACH_ENTRY_SAFE(fileloader, fileloader2, &factory->file_loaders, struct fileloader, entry)
-        release_fileloader(fileloader);
+        release_fileloader(factory, fileloader);
 
     for (i = 0; i < ARRAY_SIZE(factory->system_collections); ++i)
     {
@@ -1019,15 +1028,20 @@ HRESULT factory_get_cached_fontface(IDWriteFactory7 *iface, IDWriteFontFile * co
         DWRITE_FONT_SIMULATIONS cached_simulations;
         const void *cached_key;
         IDWriteFontFile *file;
+        IDWriteFontFace5 *fontface;
+        struct fontfacecached *verify;
+        BOOL alive = TRUE, attached = TRUE;
 
-        cached_face_index = IDWriteFontFace5_GetIndex(cached->fontface);
-        cached_simulations = IDWriteFontFace5_GetSimulations(cached->fontface);
+        fontface = cached->fontface;
+
+        cached_face_index = IDWriteFontFace5_GetIndex(fontface);
+        cached_simulations = IDWriteFontFace5_GetSimulations(fontface);
 
         /* skip earlier */
         if (cached_face_index != index || cached_simulations != simulations)
             continue;
 
-        hr = IDWriteFontFace5_GetFiles(cached->fontface, &count, &file);
+        hr = IDWriteFontFace5_GetFiles(fontface, &count, &file);
         if (FAILED(hr))
             break;
 
@@ -1038,11 +1052,52 @@ HRESULT factory_get_cached_fontface(IDWriteFactory7 *iface, IDWriteFontFile * co
 
         if (cached_key_size == key_size && !memcmp(cached_key, key, key_size))
         {
-            if (FAILED(hr = IDWriteFontFace5_QueryInterface(cached->fontface, riid, obj)))
+            /* Cached face slot fetch discipline: the wrapper is read from the slot
+               (under this section), pinned with a reference, and the slot is verified to
+               still resolve to the same instance before the face is handed out - a slot
+               that detaches mid-handout must not surface a wrapper behind it, and a
+               wrapper whose ft face object failed to build must not be handed out from a
+               slot at all (every metric or glyph call would dereference object 0). */
+            if (FAILED(hr = IDWriteFontFace5_QueryInterface(fontface, riid, obj)))
+            {
                 WARN("Failed to get %s from fontface, hr %#lx.\n", debugstr_guid(riid), hr);
+                alive = FALSE;
+            }
+            else if (!dwrite_fontface_check_font_object(fontface))
+            {
+                WARN("Cached fontface %p carries no ft face object.\n", fontface);
+                IDWriteFontFace5_Release(fontface);
+                *obj = NULL;
+                alive = FALSE;
+            }
+            else
+            {
+                attached = FALSE;
+                LIST_FOR_EACH_ENTRY(verify, fontfaces, struct fontfacecached, entry)
+                {
+                    if (verify != cached)
+                        continue;
+                    attached = TRUE;
+                    break;
+                }
 
-            TRACE("returning cached fontface %p\n", cached->fontface);
-            break;
+                if (!attached)
+                {
+                    WARN("Cached fontface %p left the slot it was read from.\n", fontface);
+                    IDWriteFontFace5_Release(fontface);
+                    *obj = NULL;
+                }
+            }
+
+            if (alive && attached)
+            {
+                TRACE("returning cached fontface %p\n", fontface);
+                break;
+            }
+
+            /* An equivalent live slot entry may follow; otherwise the caller builds a
+               fresh face from the same file, which reports its own object liveness. */
+            continue;
         }
     }
 
@@ -1220,11 +1275,25 @@ static HRESULT WINAPI dwritefactory_UnregisterFontFileLoader(IDWriteFactory7 *if
     if (!loader)
         return E_INVALIDARG;
 
+    /* Lookup, unlink and detach of the cached face slots all happen under the factory
+       critical section, the same section face resolution routes hold while searching the
+       slots: a route never searches a list that is being detached.  Taking the entry out
+       under the same section also claims it from a concurrent unregister of the same
+       loader, which then fails the lookup instead of racing the release. */
+    factory_lock(&factory->IDWriteFactory7_iface);
     found = factory_get_file_loader(factory, loader);
+    if (found)
+    {
+        list_remove(&found->entry);
+        release_fontface_cache(&found->fontfaces);
+    }
+    factory_unlock(&factory->IDWriteFactory7_iface);
+
     if (!found)
         return E_INVALIDARG;
 
-    release_fileloader(found);
+    IDWriteFontFileLoader_Release(found->loader);
+    free(found);
     return S_OK;
 }
 

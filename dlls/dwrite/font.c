@@ -786,6 +786,16 @@ void fontface_detach_from_cache(IDWriteFontFace5 *iface)
     fontface->cached = NULL;
 }
 
+/* Whether a face wrapper carries a live ft face object: the object is materialized lazily
+   on first use, and a wrapper whose ft face failed to build (invalid file, dead stream)
+   would be used with object 0 by every metric or glyph call. */
+BOOL dwrite_fontface_check_font_object(IDWriteFontFace5 *iface)
+{
+    struct dwrite_fontface *fontface = impl_from_IDWriteFontFace5(iface);
+
+    return fontface->get_font_object(fontface) != 0;
+}
+
 static BOOL is_same_fontfile(IDWriteFontFile *left, IDWriteFontFile *right)
 {
     UINT32 left_key_size, right_key_size;
