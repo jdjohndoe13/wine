@@ -1429,20 +1429,34 @@ static HRESULT WINAPI dwritefactory1_CreateCustomRenderingParams(IDWriteFactory7
 static HRESULT WINAPI dwritefactory2_GetSystemFontFallback(IDWriteFactory7 *iface, IDWriteFontFallback **fallback)
 {
     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+    IDWriteFontFallback1 *fallback1;
+    HRESULT hr;
 
     TRACE("%p, %p.\n", iface, fallback);
 
     *fallback = NULL;
 
+    /* Create and hand out under the factory lock, serialized with the instance
+       detach path, so two threads don't both build a cached instance and so
+       a concurrently disposed instance is never handed out. */
+    EnterCriticalSection(&factory->cs);
+
     if (!factory->fallback)
     {
-        HRESULT hr = create_system_fontfallback(iface, &factory->fallback);
+        hr = create_system_fontfallback(iface, &factory->fallback);
         if (FAILED(hr))
+        {
+            LeaveCriticalSection(&factory->cs);
             return hr;
+        }
     }
 
-    *fallback = (IDWriteFontFallback *)factory->fallback;
-    IDWriteFontFallback_AddRef(*fallback);
+    fallback1 = factory->fallback;
+    IDWriteFontFallback1_AddRef(fallback1);
+
+    LeaveCriticalSection(&factory->cs);
+
+    *fallback = (IDWriteFontFallback *)fallback1;
     return S_OK;
 }
 
@@ -2291,6 +2305,24 @@ void factory_detach_gdiinterop(IDWriteFactory7 *iface, IDWriteGdiInterop1 *inter
     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
     factory->gdiinterop = NULL;
     IDWriteFactory7_Release(iface);
+}
+
+/* Detach the cached system fallback instance, handled under the factory lock that also
+   serializes GetSystemFontFallback() handouts. Returns TRUE when everything dropped the
+   instance (no concurrent handout happened, so the instance is disposable), and the
+   refcount is re-checked under the same lock to catch a handout that snuck in. */
+BOOL factory_detach_system_fontfallback(IDWriteFactory7 *iface, IDWriteFontFallback1 *fallback, LONG *refcount)
+{
+    struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+    IDWriteFontFallback1 *cached;
+    ULONG value;
+
+    EnterCriticalSection(&factory->cs);
+    cached = InterlockedCompareExchangePointer((void **)&factory->fallback, NULL, fallback);
+    value = InterlockedCompareExchange(refcount, 0, 0);
+    LeaveCriticalSection(&factory->cs);
+
+    return cached == fallback && value == 0;
 }
 
 HRESULT WINAPI DWriteCreateFactory(DWRITE_FACTORY_TYPE type, REFIID riid, IUnknown **ret)

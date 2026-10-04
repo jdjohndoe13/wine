@@ -364,6 +364,7 @@ extern HRESULT factory_get_cached_fontface(IDWriteFactory7 *factory, IDWriteFont
         DWRITE_FONT_SIMULATIONS simulations, struct list **cache, REFIID riid, void **obj);
 extern void factory_detach_fontcollection(IDWriteFactory7 *factory, IDWriteFontCollection3 *collection);
 extern void factory_detach_gdiinterop(IDWriteFactory7 *factory, IDWriteGdiInterop1 *interop);
+extern BOOL factory_detach_system_fontfallback(IDWriteFactory7 *factory, IDWriteFontFallback1 *fallback, LONG *refcount);
 extern struct fontfacecached *factory_cache_fontface(IDWriteFactory7 *factory, struct list *fontfaces,
         IDWriteFontFace5 *fontface);
 extern IDWriteFontFile *get_fontfile_from_font(IDWriteFont *font);
