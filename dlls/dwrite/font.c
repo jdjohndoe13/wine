@@ -2925,13 +2925,34 @@ static HRESULT WINAPI dwritefontfamily_GetFont(IDWriteFontFamily2 *iface, UINT32
     return hr;
 }
 
+/* TRACE payload only: the family name behind a matching or probe reply (the first
+   localized string of the family, "(none)" when no name material is behind the
+   family).  Used by the probe-only NULLREPLY/SEEDFILL lines; no control flow
+   or returned value is affected by it. */
+static const WCHAR *fontfamily_name_for_trace(struct dwrite_fontfamily_data *data, WCHAR *buffer)
+{
+    if (data && data->familyname && SUCCEEDED(IDWriteLocalizedStrings_GetString(data->familyname, 0, buffer, 255)))
+        return buffer;
+    return L"(none)";
+}
+
 static HRESULT WINAPI dwritefontfamily_GetFamilyNames(IDWriteFontFamily2 *iface, IDWriteLocalizedStrings **names)
 {
     struct dwrite_fontfamily *family = impl_from_IDWriteFontFamily2(iface);
+    WCHAR famname[255];
+    HRESULT hr;
 
     TRACE("%p, %p.\n", iface, names);
 
-    return clone_localizedstrings(family->data->familyname, names);
+    hr = clone_localizedstrings(family->data->familyname, names);
+
+    if (FAILED(hr))
+        TRACE("NULLREPLY: GetFamilyNames failed hr=0x%08x fam=%s.\n", hr,
+                debugstr_w(fontfamily_name_for_trace(family->data, famname)));
+    else if (*names && !IDWriteLocalizedStrings_GetCount(*names))
+        TRACE("NULLREPLY: GetFamilyNames empty fam=%s.\n", debugstr_w(fontfamily_name_for_trace(family->data, famname)));
+
+    return hr;
 }
 
 static BOOL is_better_font_match(const struct dwrite_font_propvec *next, const struct dwrite_font_propvec *cur,
@@ -3000,6 +3021,10 @@ static HRESULT WINAPI dwritefontfamily_GetFirstMatchingFont(IDWriteFontFamily2 *
 
     if (!family->data->count)
     {
+        WCHAR famname[255];
+
+        TRACE("NULLREPLY: GetFirstMatchingFont empty fam=%s weight=%d stretch=%d style=%d.\n",
+                debugstr_w(fontfamily_name_for_trace(family->data, famname)), weight, stretch, style);
         *font = NULL;
         return dwrite_get_default_font(family->collection->factory, &IID_IDWriteFont, (void **)font);
     }
@@ -3070,12 +3095,16 @@ static HRESULT WINAPI dwritefontfamily_GetMatchingFonts(IDWriteFontFamily2 *ifac
     *ret = NULL;
 
     if (!(fonts = malloc(sizeof(*fonts))))
+    {
+        TRACE("NULLREPLY: GetMatchingFonts out of memory.\n");
         return E_OUTOFMEMORY;
+    }
 
     /* Allocate as many as family has, not all of them will be necessary used. */
     if (!(fonts->fonts = calloc(family->data->count, sizeof(*fonts->fonts))))
     {
         free(fonts);
+        TRACE("NULLREPLY: GetMatchingFonts out of memory.\n");
         return E_OUTOFMEMORY;
     }
 
@@ -3117,6 +3146,10 @@ static HRESULT WINAPI dwritefontfamily_GetMatchingFonts(IDWriteFontFamily2 *ifac
     {
         if (!family->data->count)
         {
+            WCHAR famname[255];
+
+            TRACE("NULLREPLY: GetMatchingFonts empty fam=%s weight=%d stretch=%d style=%d.\n",
+                    debugstr_w(fontfamily_name_for_trace(family->data, famname)), weight, stretch, style);
             IDWriteFontFamily2_Release(&fonts->family->IDWriteFontFamily2_iface);
             free(fonts->fonts);
             free(fonts);
@@ -3161,7 +3194,10 @@ static HRESULT WINAPI dwritefontfamily1_GetFont(IDWriteFontFamily2 *iface, UINT3
         return dwrite_get_default_font(family->collection->factory, &IID_IDWriteFont3, (void **)font);
 
     if (index >= family->data->count)
+    {
+        TRACE("NULLREPLY: family GetFont index OOB index=%u count=%Iu.\n", index, family->data->count);
         return E_FAIL;
+    }
 
     if (FAILED(hr = create_font(family, index, font)))
         return dwrite_get_default_font(family->collection->factory, &IID_IDWriteFont3, (void **)font);
@@ -3181,7 +3217,10 @@ static HRESULT WINAPI dwritefontfamily1_GetFontFaceReference(IDWriteFontFamily2 
     *reference = NULL;
 
     if (index >= family->data->count)
+    {
+        TRACE("NULLREPLY: family GetFontFaceReference index OOB index=%u count=%Iu.\n", index, family->data->count);
         return E_FAIL;
+    }
 
     font = family->data->fonts[index];
     if (FAILED(hr = IDWriteFactory5_CreateFontFaceReference_((IDWriteFactory5 *)family->collection->factory,
@@ -3200,6 +3239,8 @@ static HRESULT WINAPI dwritefontfamily2_GetMatchingFonts(IDWriteFontFamily2 *ifa
         DWRITE_FONT_AXIS_VALUE const *axis_values, UINT32 num_values, IDWriteFontList2 **fontlist)
 {
     FIXME("%p, %p, %u, %p.\n", iface, axis_values, num_values, fontlist);
+
+    TRACE("NULLREPLY: fontfamily2 GetMatchingFonts E_NOTIMPL.\n");
 
     return E_NOTIMPL;
 }
@@ -3415,6 +3456,9 @@ static UINT32 WINAPI dwritefontcollection_GetFontFamilyCount(IDWriteFontCollecti
     if (!collection->count && collection->is_system)
         fontcollection_ensure_seed_families(collection);
 
+    if (!collection->count && collection->is_system)
+        TRACE("NULLREPLY: empty system font collection.\n");
+
     return collection->count;
 }
 
@@ -3436,7 +3480,10 @@ static HRESULT WINAPI dwritefontcollection_GetFontFamily(IDWriteFontCollection3 
         fontcollection_ensure_seed_families(collection);
 
     if (index >= collection->count)
+    {
+        TRACE("NULLREPLY: GetFontFamily index OOB index=%u families=%Iu.\n", index, collection->count);
         return E_FAIL;
+    }
 
     if (FAILED(hr = create_fontfamily(collection, index, &family)))
         return dwrite_get_default_fontfamily(collection->factory, &IID_IDWriteFontFamily, (void **)ret);
@@ -3490,6 +3537,7 @@ static HRESULT WINAPI dwritefontcollection_FindFamilyName(IDWriteFontCollection3
        family whose matching hands out a loadable font, never a null exists-return. */
     if (collection->is_system && collection->count && (!name || !*name))
     {
+        TRACE("SEEDFILL: FindFamilyName alias-resolved fam=%s.\n", debugstr_w(name));
         *index = 0;
         *exists = TRUE;
         return S_OK;
@@ -3497,6 +3545,10 @@ static HRESULT WINAPI dwritefontcollection_FindFamilyName(IDWriteFontCollection3
 
     *index = collection_find_family(collection, name);
     *exists = *index != ~0u;
+
+    if (!*exists)
+        TRACE("NULLREPLY: FindFamilyName miss fam=%s families=%Iu.\n", debugstr_w(name), collection->count);
+
     return S_OK;
 }
 
@@ -3516,12 +3568,16 @@ static HRESULT WINAPI dwritefontcollection_GetFontFromFontFace(IDWriteFontCollec
     *font = NULL;
 
     if (!face)
+    {
+        TRACE("NULLREPLY: GetFontFromFontFace no face.\n");
         return E_INVALIDARG;
+    }
 
     count = 1;
     if (FAILED(hr = IDWriteFontFace_GetFiles(face, &count, &file)))
     {
         WARN("Failed to get font face files, hr %#lx.\n", hr);
+        TRACE("NULLREPLY: GetFontFromFontFace face files failed hr=0x%08x.\n", hr);
         return dwrite_get_default_font(collection->factory, &IID_IDWriteFont, (void **)font);
     }
     face_index = IDWriteFontFace_GetIndex(face);
@@ -3550,13 +3606,22 @@ static HRESULT WINAPI dwritefontcollection_GetFontFromFontFace(IDWriteFontCollec
        left NULL, whether the collection failed to match the face or the resolution itself
        failed. */
     if (!found_font)
+    {
+        TRACE("NULLREPLY: GetFontFromFontFace face not found face_index=%u.\n", face_index);
         return dwrite_get_default_font(collection->factory, &IID_IDWriteFont, (void **)font);
+    }
 
     if (FAILED(hr = create_fontfamily(collection, i, &family)))
+    {
+        TRACE("NULLREPLY: GetFontFromFontFace create family failed hr=0x%08x.\n", hr);
         return dwrite_get_default_font(collection->factory, &IID_IDWriteFont, (void **)font);
+    }
 
     if (FAILED(hr = create_font(family, j, (IDWriteFont3 **)font)))
+    {
+        TRACE("NULLREPLY: GetFontFromFontFace create font failed hr=0x%08x.\n", hr);
         return dwrite_get_default_font(collection->factory, &IID_IDWriteFont, (void **)font);
+    }
     IDWriteFontFamily2_Release(&family->IDWriteFontFamily2_iface);
 
     return hr;
@@ -3617,7 +3682,10 @@ static HRESULT WINAPI dwritefontcollection1_GetFontFamily(IDWriteFontCollection3
         fontcollection_ensure_seed_families(collection);
 
     if (index >= collection->count)
+    {
+        TRACE("NULLREPLY: collection1 GetFontFamily index OOB index=%u families=%Iu.\n", index, collection->count);
         return E_FAIL;
+    }
 
     if (SUCCEEDED(hr = create_fontfamily(collection, index, &family)))
         *ret = (IDWriteFontFamily1 *)&family->IDWriteFontFamily2_iface;
@@ -3640,7 +3708,10 @@ static HRESULT WINAPI dwritefontcollection2_GetFontFamily(IDWriteFontCollection3
         fontcollection_ensure_seed_families(collection);
 
     if (index >= collection->count)
+    {
+        TRACE("NULLREPLY: collection2 GetFontFamily index OOB index=%u families=%Iu.\n", index, collection->count);
         return E_FAIL;
+    }
 
     if (SUCCEEDED(hr = create_fontfamily(collection, index, &family)))
         *ret = &family->IDWriteFontFamily2_iface;
@@ -3653,6 +3724,8 @@ static HRESULT WINAPI dwritefontcollection2_GetMatchingFonts(IDWriteFontCollecti
         IDWriteFontList2 **fontlist)
 {
     FIXME("%p, %s, %p, %u, %p.\n", iface, debugstr_w(familyname), axis_values, num_values, fontlist);
+
+    TRACE("NULLREPLY: collection2 GetMatchingFonts E_NOTIMPL fam=%s.\n", debugstr_w(familyname));
 
     return E_NOTIMPL;
 }
@@ -5239,6 +5312,7 @@ static void fontcollection_seed_fallback_families(struct dwrite_fontcollection *
 static void fontcollection_ensure_seed_families(struct dwrite_fontcollection *collection)
 {
     size_t i;
+    WCHAR famname[255];
 
     EnterCriticalSection(&collection->cs);
 
@@ -5257,8 +5331,14 @@ static void fontcollection_ensure_seed_families(struct dwrite_fontcollection *co
                     fontfamily_add_oblique_simulated_face(collection->family_data[i]);
                 }
             }
+
+            for (i = 0; i < collection->count; ++i)
+                TRACE("SEEDFILL: fam=%s.\n", debugstr_w(fontfamily_name_for_trace(collection->family_data[i], famname)));
+
             TRACE("Hydrated catalogued seed families on read, %Iu families.\n", collection->count);
         }
+
+        TRACE("SEEDFILL: families=%Iu.\n", collection->count);
     }
 
     LeaveCriticalSection(&collection->cs);
@@ -5310,6 +5390,7 @@ HRESULT system_fontset_seed_entries(IDWriteFactory7 *factory, struct dwrite_font
     if (FAILED(create_system_path_list(&paths, &count)))
     {
         WARN("Failed to list resident system fonts, ignoring.\n");
+        TRACE("NULLREPLY: system fontset seed no path list.\n");
         return E_UNEXPECTED;
     }
 
@@ -5352,6 +5433,7 @@ HRESULT system_fontset_seed_entries(IDWriteFactory7 *factory, struct dwrite_font
     if (!materialized)
     {
         WARN("No resident loadable system font file to hydrate the fresh factory system table from.\n");
+        TRACE("NULLREPLY: system fontset seed no materialized file.\n");
         return E_FAIL;
     }
 
@@ -5377,6 +5459,7 @@ HRESULT system_fontset_seed_entries(IDWriteFactory7 *factory, struct dwrite_font
 
     if (FAILED(hr) || !entry_count)
     {
+        TRACE("NULLREPLY: system fontset seed entries failed entr=%u hr=0x%08x.\n", entry_count, FAILED(hr) ? hr : E_FAIL);
         for (i = 0; i < entry_count; ++i)
             release_fontset_entry(entries[i]);
         free(entries);
@@ -5385,6 +5468,8 @@ HRESULT system_fontset_seed_entries(IDWriteFactory7 *factory, struct dwrite_font
 
     *ret = entries;
     *ret_count = entry_count;
+
+    TRACE("SEEDFILL: entr=%u.\n", entry_count);
 
     return S_OK;
 }
@@ -8338,6 +8423,9 @@ static HRESULT WINAPI dwritefontset_GetMatchingFonts_(IDWriteFontSet3 *iface, WC
 {
     FIXME("%p, %s, %d, %d, %d, %p.\n", iface, debugstr_w(family), weight, stretch, style, fontset);
 
+    TRACE("NULLREPLY: fontset GetMatchingFonts E_NOTIMPL fam=%s weight=%d stretch=%d style=%d.\n",
+            debugstr_w(family), weight, stretch, style);
+
     return E_NOTIMPL;
 }
 
@@ -8373,6 +8461,8 @@ static HRESULT WINAPI dwritefontset_GetMatchingFonts(IDWriteFontSet3 *iface, DWR
 
     if (!matched_count)
     {
+        TRACE("NULLREPLY: fontset GetMatchingFonts empty nset=%u nprops=%u fam=%s.\n", set->count, count,
+                debugstr_w(props && count ? props[0].propertyValue : NULL));
         free(entries);
         entries = NULL;
     }
@@ -8388,6 +8478,8 @@ static HRESULT WINAPI dwritefontset1_GetMatchingFonts(IDWriteFontSet3 *iface, DW
         DWRITE_FONT_AXIS_VALUE const *axis_values, UINT32 num_values, IDWriteFontSet1 **fontset)
 {
     FIXME("%p, %p, %p, %u, %p.\n", iface, property, axis_values, num_values, fontset);
+
+    TRACE("NULLREPLY: fontset1 GetMatchingFonts E_NOTIMPL.\n");
 
     return E_NOTIMPL;
 }

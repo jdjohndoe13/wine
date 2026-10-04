@@ -1652,6 +1652,20 @@ HRESULT opentype_analyze_font(IDWriteFontFileStream *stream, BOOL *supported, DW
         analyzer++;
     }
 
+    if (*file_type == DWRITE_FONT_FILE_TYPE_UNKNOWN)
+    {
+        const DWORD *magic;
+        void *context;
+        DWORD head = 0;
+
+        if (SUCCEEDED(IDWriteFontFileStream_ReadFileFragment(stream, (const void **)&magic, 0, sizeof(*magic), &context)))
+        {
+            head = *magic;
+            IDWriteFontFileStream_ReleaseFileFragment(stream, context);
+        }
+        TRACE("NULLREPLY: opentype analyze unsupported magic head=0x%08x.\n", head);
+    }
+
     *supported = is_face_type_supported(*face_type);
     return S_OK;
 }

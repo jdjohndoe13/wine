@@ -772,6 +772,7 @@ static HRESULT factory_get_system_collection(struct dwritefactory *factory,
     if (family_model != DWRITE_FONT_FAMILY_MODEL_TYPOGRAPHIC &&
             family_model != DWRITE_FONT_FAMILY_MODEL_WEIGHT_STRETCH_STYLE)
     {
+        TRACE("NULLREPLY: GetSystemFontCollection invalid model %d.\n", family_model);
         return E_INVALIDARG;
     }
 
@@ -788,6 +789,7 @@ static HRESULT factory_get_system_collection(struct dwritefactory *factory,
         if (FAILED(hr = get_system_fontcollection(&factory->IDWriteFactory7_iface, family_model, &collection)))
         {
             WARN("Failed to create system font collection, hr %#lx.\n", hr);
+            TRACE("NULLREPLY: GetSystemFontCollection failed model=%d hr=0x%08x.\n", family_model, hr);
             return hr;
         }
 
@@ -795,6 +797,7 @@ static HRESULT factory_get_system_collection(struct dwritefactory *factory,
             IDWriteFontCollection_Release(collection);
     }
 
+    TRACE("NULLREPLY: GetSystemFontCollection cache slot detached twice.\n");
     return E_FAIL;
 }
 
@@ -949,10 +952,16 @@ static HRESULT WINAPI dwritefactory_CreateFontFileReference(IDWriteFactory7 *ifa
     /* Get a reference key in local file loader format. */
     hr = get_local_refkey(path, writetime, &key, &key_size);
     if (FAILED(hr))
+    {
+        TRACE("NULLREPLY: CreateFontFileReference refkey failed path=%s hr=0x%08x.\n", debugstr_w(path), hr);
         return hr;
+    }
 
     hr = create_font_file(factory->localfontfileloader, key, key_size, font_file);
     free(key);
+
+    if (FAILED(hr))
+        TRACE("NULLREPLY: CreateFontFileReference create failed path=%s hr=0x%08x.\n", debugstr_w(path), hr);
 
     return hr;
 }
@@ -1143,16 +1152,28 @@ static HRESULT WINAPI dwritefactory_CreateFontFace(IDWriteFactory7 *iface, DWRIT
     *fontface = NULL;
 
     if (!is_face_type_supported(req_facetype))
+    {
+        TRACE("NULLREPLY: CreateFontFace facetype unsupported facetype=%d.\n", req_facetype);
         return E_INVALIDARG;
+    }
 
     if (req_facetype != DWRITE_FONT_FACE_TYPE_OPENTYPE_COLLECTION && index)
+    {
+        TRACE("NULLREPLY: CreateFontFace invalid index index=%u facetype=%d.\n", index, req_facetype);
         return E_INVALIDARG;
+    }
 
     if (!is_simulation_valid(simulations))
+    {
+        TRACE("NULLREPLY: CreateFontFace invalid simulations=0x%08x.\n", simulations);
         return E_INVALIDARG;
+    }
 
     if (FAILED(hr = get_filestream_from_file(*font_files, &stream)))
+    {
+        TRACE("NULLREPLY: CreateFontFace file stream failed hr=0x%08x.\n", hr);
         return hr;
+    }
 
     /* check actual file/face type */
     is_supported = FALSE;
@@ -1187,6 +1208,9 @@ static HRESULT WINAPI dwritefactory_CreateFontFace(IDWriteFactory7 *iface, DWRIT
 
 failed:
     IDWriteFontFileStream_Release(stream);
+
+    if (FAILED(hr))
+        TRACE("NULLREPLY: CreateFontFace failed facetype=%d index=%u hr=0x%08x.\n", req_facetype, index, hr);
 
     /* A resolution that would dereference a dead ft face (the wrapper reported no live
        face object behind it) resolves to the process pinned default face object instead
@@ -1903,6 +1927,7 @@ HRESULT create_system_fontset(IDWriteFactory7 *factory_iface, REFIID riid, void 
         }
         else
         {
+            TRACE("NULLREPLY: factory system fontset seed fill failed seedcnt=%u hr=0x%08x.\n", seed_count, hr);
             for (i = 0; i < seed_count; ++i)
                 release_fontset_entry(seed_entries[i]);
             free(seed_entries);
@@ -2087,6 +2112,8 @@ static HRESULT WINAPI dwritefactory5_UnpackFontFile(IDWriteFactory7 *iface, DWRI
         UINT32 data_size, IDWriteFontFileStream **stream)
 {
     FIXME("%p, %d, %p, %u, %p: stub\n", iface, container_type, data, data_size, stream);
+
+    TRACE("NULLREPLY: UnpackFontFile E_NOTIMPL containertype=%d.\n", container_type);
 
     return E_NOTIMPL;
 }
