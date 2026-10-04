@@ -1187,6 +1187,14 @@ static HRESULT WINAPI dwritefactory_CreateFontFace(IDWriteFactory7 *iface, DWRIT
 
 failed:
     IDWriteFontFileStream_Release(stream);
+
+    /* A resolution that would dereference a dead ft face (the wrapper reported no live
+       face object behind it) resolves to the process pinned default face object instead
+       of leaving the caller a NULL or dead carrier - the same handout semantics as the
+       font resolution routes. */
+    if (hr == DWRITE_E_NOFONT && !*fontface)
+        return dwrite_get_default_fontface(iface, &IID_IDWriteFontFace, (void **)fontface);
+
     return hr;
 }
 
