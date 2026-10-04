@@ -390,6 +390,11 @@ extern HRESULT create_font_collection_from_set(IDWriteFactory7 *factory, IDWrite
         DWRITE_FONT_FAMILY_MODEL family_model, REFGUID riid, void **ret);
 extern HRESULT create_system_fontset(IDWriteFactory7 *factory, REFIID riid, void **obj);
 
+/* Resident system font file list (registry fonts table) - backs the catalogued
+   fallback families a system collection view is seeded with when it would
+   otherwise surface with zero families. */
+extern HRESULT create_system_path_list(WCHAR ***ret, unsigned int *ret_count);
+
 struct dwrite_fontset_entry;
 extern void release_fontset_entry(struct dwrite_fontset_entry *);
 extern HRESULT fontset_builder_get_entries(IDWriteFontSetBuilder2 *iface, struct dwrite_fontset_entry ***ret,

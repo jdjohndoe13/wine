@@ -1686,7 +1686,7 @@ static HKEY open_fonts_key(void)
     return hkey;
 }
 
-static HRESULT create_system_path_list(WCHAR ***ret, unsigned int *ret_count)
+HRESULT create_system_path_list(WCHAR ***ret, unsigned int *ret_count)
 {
     unsigned int index = 0, value_size, max_name_count;
     WCHAR **paths = NULL, *name, *value = NULL;
