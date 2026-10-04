@@ -3349,6 +3349,11 @@ static ULONG WINAPI dwritefontcollection_Release(IDWriteFontCollection3 *iface)
     return refcount;
 }
 
+/* The family-count view callers enumerate through: a collection's family list is an
+   immutable snapshot materialized at build time (from the factory's system set, which
+   itself never installs empty rebuild content) and optionally seeded with catalogued
+   fallback families when it would otherwise surface empty - so enumeration callers
+   never see the view collapse to zero during a teardown window. */
 static UINT32 WINAPI dwritefontcollection_GetFontFamilyCount(IDWriteFontCollection3 *iface)
 {
     struct dwrite_fontcollection *collection = impl_from_IDWriteFontCollection3(iface);
@@ -4863,6 +4868,8 @@ static HRESULT collection_add_font_entry(struct dwrite_fontcollection *collectio
     return hr;
 }
 
+static void fontcollection_seed_fallback_families(struct dwrite_fontcollection *collection);
+
 HRESULT create_font_collection_from_set(IDWriteFactory7 *factory, IDWriteFontSet *fontset,
         DWRITE_FONT_FAMILY_MODEL family_model, REFGUID riid, void **ret)
 {
@@ -4913,6 +4920,15 @@ HRESULT create_font_collection_from_set(IDWriteFactory7 *factory, IDWriteFontSet
         IDWriteFontFileStream_Release(stream);
     }
 
+    /* A system collection view must never report zero families: when every entry
+       failed to hydrate (dead streams in an engine restart window) or the underlying
+       set itself came back empty from the rebuild scan, the family-count view
+       collapses to "no families" for every caller walking the collection. Seed
+       catalogued fallback families materialized from a resident font file instead -
+       the collection hands out real, loadable faces under the ladder family names. */
+    if (set->is_system && !collection->count)
+        fontcollection_seed_fallback_families(collection);
+
     if (family_model == DWRITE_FONT_FAMILY_MODEL_WEIGHT_STRETCH_STYLE)
     {
         for (i = 0; i < collection->count; ++i)
@@ -4950,6 +4966,152 @@ static HRESULT create_local_file_reference(IDWriteFactory7 *factory, const WCHAR
         hr = IDWriteFactory7_CreateFontFileReference(factory, filename, NULL, file);
 
     return hr;
+}
+
+/* Catalogued minimal family set a system collection view is seeded with when it
+   would otherwise surface with zero families (every entry failed to hydrate, or
+   the system set scan itself came back empty in an engine restart window).
+   Blink-style enumeration callers - SkFontMgr_DirectWrite countFamilies() and the
+   last-resort family ladder - must never walk a collapsed zero-family view. */
+static const WCHAR *const fallback_families_catalog[] =
+{
+    L"Segoe UI",
+    L"Arial",
+    L"Microsoft Sans Serif",
+    L"Tahoma",
+    L"Times New Roman",
+    L"Courier New",
+    L"Calibri",
+};
+
+static BOOL fontcollection_seed_fallback_family(struct dwrite_fontcollection *collection,
+        IDWriteFontFile *file, IDWriteFontFileStream *stream, DWRITE_FONT_FACE_TYPE face_type,
+        UINT32 face_count, const WCHAR *name)
+{
+    struct dwrite_fontfamily_data *family_data;
+    IDWriteLocalizedStrings *familyname;
+    struct dwrite_font_data *font_data;
+    UINT32 i;
+    HRESULT hr;
+
+    if (FAILED(hr = create_localizedstrings(&familyname)))
+        return FALSE;
+
+    add_localizedstring(familyname, L"en-us", name);
+
+    hr = init_fontfamily_data(familyname, &family_data);
+    IDWriteLocalizedStrings_Release(familyname);
+    if (FAILED(hr))
+        return FALSE;
+
+    for (i = 0; i < face_count; ++i)
+    {
+        struct fontface_desc desc;
+
+        desc.factory = collection->factory;
+        desc.face_type = face_type;
+        desc.file = file;
+        desc.stream = stream;
+        desc.index = i;
+        desc.simulations = DWRITE_FONT_SIMULATIONS_NONE;
+        desc.font_data = NULL;
+
+        if (FAILED(init_font_data(&desc, collection->family_model, &font_data)))
+            continue;
+
+        if (FAILED(fontfamily_add_font(family_data, font_data)))
+            release_font_data(font_data);
+    }
+
+    /* A family without loadable faces must not enter the collection: its slot
+       would keep surfacing an enumeration entry whose fonts resolve to nothing
+       (the same contract as every other collection build path). */
+    if (!family_data->count)
+    {
+        release_fontfamily_data(family_data);
+        return FALSE;
+    }
+
+    hr = fontcollection_add_family(collection, family_data);
+    if (FAILED(hr))
+        release_fontfamily_data(family_data);
+
+    return SUCCEEDED(hr);
+}
+
+static void fontcollection_seed_fallback_families(struct dwrite_fontcollection *collection)
+{
+    DWRITE_FONT_FILE_TYPE file_type;
+    DWRITE_FONT_FACE_TYPE face_type;
+    IDWriteFontFileStream *stream;
+    IDWriteFontFile *file;
+    WCHAR **paths;
+    unsigned int count, i, j;
+    UINT32 face_count;
+    BOOL materialized = FALSE, added = FALSE;
+
+    if (FAILED(create_system_path_list(&paths, &count)))
+    {
+        WARN("Failed to list resident system fonts, ignoring.\n");
+        return;
+    }
+
+    /* Any resident system font file backs the materialized faces; only the family
+       names are catalogued. Each seed family materializes its faces on demand from
+       this file through the same face resolution routes as normal families. */
+    stream = NULL;
+    file = NULL;
+    for (i = 0; i < count && !materialized; ++i)
+    {
+        BOOL supported;
+
+        if (FAILED(create_local_file_reference(collection->factory, paths[i], &file)))
+            continue;
+
+        if (FAILED(get_filestream_from_file(file, &stream)))
+        {
+            IDWriteFontFile_Release(file);
+            file = NULL;
+            continue;
+        }
+
+        if (SUCCEEDED(opentype_analyze_font(stream, &supported, &file_type, &face_type, &face_count))
+                && supported && face_count)
+        {
+            materialized = TRUE;
+            TRACE("Seeding fallback families from %s (file type %u).\n", debugstr_w(paths[i]), file_type);
+        }
+        else
+        {
+            IDWriteFontFileStream_Release(stream);
+            IDWriteFontFile_Release(file);
+            stream = NULL;
+            file = NULL;
+        }
+    }
+
+    for (i = 0; i < count; ++i)
+        free(paths[i]);
+    free(paths);
+
+    if (!materialized)
+    {
+        WARN("No resident system font file to materialize fallback families from.\n");
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(fallback_families_catalog); ++i)
+    {
+        if (fontcollection_seed_fallback_family(collection, file, stream, face_type, face_count,
+                fallback_families_catalog[i]))
+            added = TRUE;
+    }
+
+    IDWriteFontFileStream_Release(stream);
+    IDWriteFontFile_Release(file);
+
+    if (added)
+        TRACE("Seeded catalogued fallback families for an empty system collection.\n");
 }
 
 HRESULT get_system_fontcollection(IDWriteFactory7 *factory, DWRITE_FONT_FAMILY_MODEL family_model,
