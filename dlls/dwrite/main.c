@@ -1797,13 +1797,11 @@ static int __cdecl create_system_fontset_compare(const void *left, const void *r
 
 static HRESULT factory_create_system_fontset(struct dwritefactory *factory, const FILETIME *timestamp)
 {
+    struct dwrite_fontset_entry **rebuilt = NULL;
     IDWriteFontSetBuilder2 *builder;
-    unsigned int i, j, count;
+    unsigned int i, j, count, rebuilt_count = 0;
     WCHAR **paths;
     HRESULT hr;
-
-    factory_cleanup_fontset(factory);
-    factory->system_set.timestamp = *timestamp;
 
     if (FAILED(hr = create_fontset_builder(&factory->IDWriteFactory7_iface, TRUE, &builder))) return hr;
 
@@ -1828,10 +1826,32 @@ static HRESULT factory_create_system_fontset(struct dwritefactory *factory, cons
         free(paths);
     }
 
-    hr = fontset_builder_get_entries(builder, &factory->system_set.entries, &factory->system_set.count);
+    /* The rebuilt content is materialized away from the factory table: the standing
+       table keeps serving the family-count view while the rebuild is in flight, so a
+       collection handed out during the rebuild window never tips over an emptied set. */
+    hr = fontset_builder_get_entries(builder, &rebuilt, &rebuilt_count);
     IDWriteFontSetBuilder2_Release(builder);
 
-    return hr;
+    /* The family-count view behind enumeration callers never collapses to zero:
+       an empty rebuild (a restart window scan that found no fonts, or no openable
+       fonts key) is rejected instead of replacing a standing non-empty snapshot.
+       The timestamp is only stamped for accepted content, so a rejected empty scan
+       is retried on the next fetch rather than pinning the empty view. */
+    if (SUCCEEDED(hr) && rebuilt_count)
+    {
+        factory_cleanup_fontset(factory);
+        factory->system_set.entries = rebuilt;
+        factory->system_set.count = rebuilt_count;
+        factory->system_set.timestamp = *timestamp;
+    }
+    else
+    {
+        for (i = 0; i < rebuilt_count; ++i)
+            release_fontset_entry(rebuilt[i]);
+        free(rebuilt);
+    }
+
+    return S_OK;
 }
 
 HRESULT create_system_fontset(IDWriteFactory7 *factory_iface, REFIID riid, void **obj)
@@ -1839,7 +1859,7 @@ HRESULT create_system_fontset(IDWriteFactory7 *factory_iface, REFIID riid, void 
     struct dwritefactory *factory = impl_from_IDWriteFactory7(factory_iface);
     IDWriteFontSet *fontset;
     FILETIME timestamp;
-    HRESULT hr = S_OK;
+    HRESULT hr;
 
     *obj = NULL;
 
@@ -1847,10 +1867,17 @@ HRESULT create_system_fontset(IDWriteFactory7 *factory_iface, REFIID riid, void 
 
     EnterCriticalSection(&factory->cs);
 
+    /* A rebuild attempt materializes its content away from the factory table and is
+       only accepted non-empty (see factory_create_system_fontset). If that attempt
+       still fails outright, the standing snapshot keeps serving the view below: a
+       restart window must not collapse a family count callers already enumerate
+       from to zero. */
     if (CompareFileTime(&timestamp, &factory->system_set.timestamp) > 0)
         hr = factory_create_system_fontset(factory, &timestamp);
+    else
+        hr = S_OK;
 
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr) || (factory->system_set.entries && factory->system_set.count))
     {
         hr = fontset_create_from_set(factory_iface, factory->system_set.entries,
                 factory->system_set.count, TRUE, &fontset);
