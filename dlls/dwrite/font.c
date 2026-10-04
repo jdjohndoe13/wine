@@ -355,6 +355,13 @@ struct dwrite_fontcollection
     BOOL is_system;
     CRITICAL_SECTION cs; /* serializes the entry-instant seed hydration on reads */
 
+    /* The product-name alias layer preferred-target resolution, lazily computed once
+       per system collection view and cached under the same section as the seed
+       hydration (the family list is an immutable build-time snapshot, so the first
+       present preferred target never changes while the view is alive). */
+    BOOL alias_target_cached;
+    UINT32 alias_target_index;
+
     struct
     {
         struct dwrite_fontset_entry **entries;
@@ -3493,6 +3500,150 @@ static HRESULT WINAPI dwritefontcollection_GetFontFamily(IDWriteFontCollection3 
     return S_OK;
 }
 
+/* A locale-invariant case-insensitive compare: DirectWrite's documented family-name
+   search is case-insensitive, and the invariant caseless compare (CompareStringW with
+   NORM_IGNORECASE against LOCALE_INVARIANT) does not trail a lower-cased query to a
+   miss the way a localized fold can for names outside the caller's locale. */
+static BOOL family_names_match_insensitive(const WCHAR *a, const WCHAR *b)
+{
+    return CompareStringW(LOCALE_INVARIANT, NORM_IGNORECASE, a, -1, b, -1) == CSTR_EQUAL;
+}
+
+static UINT32 collection_find_family_insensitive(struct dwrite_fontcollection *collection, const WCHAR *name)
+{
+    size_t i;
+
+    for (i = 0; i < collection->count; ++i)
+    {
+        IDWriteLocalizedStrings *family_name = collection->family_data[i]->familyname;
+        UINT32 j, count = IDWriteLocalizedStrings_GetCount(family_name);
+        HRESULT hr;
+
+        for (j = 0; j < count; j++)
+        {
+            WCHAR buffer[255];
+            hr = IDWriteLocalizedStrings_GetString(family_name, j, buffer, ARRAY_SIZE(buffer));
+            if (SUCCEEDED(hr) && family_names_match_insensitive(buffer, name))
+                return i;
+        }
+    }
+
+    return ~0u;
+}
+
+/* The product family names callers resolve through on a system collection view that
+   wine never installs: the ladder/last-resort names Blink walks, the script/symbol
+   fallback names, and the generic names. A lookup miss feeding them poisons the
+   caller's negative font cache, so the alias layer resolves them through one
+   preferred target family instead. The lookup side is case-insensitive too;
+   the layer is applied on system collection views only, and never changes the
+   family counts or the enumeration order of the view. */
+static const struct
+{
+    const WCHAR *alias;
+} systemfamily_alias_names[] =
+{
+    { L"Segoe UI" },
+    { L"Calibri" },
+    { L"Times New Roman" },
+    { L"Courier New" },
+    { L"Arial" },
+    { L"Microsoft Sans Serif" },
+    { L"MS UI Gothic" },
+    { L"MS PGothic" },
+    { L"MS Gothic" },
+    { L"SimSun" },
+    { L"NSimSun" },
+    { L"Gulim" },
+    { L"PMingLiU" },
+    { L"Code2000" },
+    { L"FreeSans" },
+    { L"FreeSerif" },
+    { L"Gentium" },
+    { L"GentiumAlt" },
+    { L"Segoe UI Symbol" },
+    { L"Segoe UI Emoji" },
+    { L"Segoe Fluent Icons" },
+    { L"Cambria Math" },
+    { L"Helvetica" },
+    { L"Times" },
+    { L"Palatino Linotype" },
+    { L"Lucida Sans Unicode" },
+    { L"Arial Unicode MS" },
+    { L"Noto Sans Symbols 2" },
+    { L"Tahoma" },
+    { L"Trebuchet MS" },
+    { L"Impact" },
+    { L"Georgia" },
+    { L"Comic Sans MS" },
+    { L"Verdana" },
+    { L"sans-serif" },
+    { L"ui-sans-serif" },
+};
+
+/* The preferred target family list the alias layer resolves a product-name query
+   through, tried in order against the collection's real names case-insensitively;
+   the first present target wins, the standing first family is the fallback when
+   none of them is resident. */
+static const struct
+{
+    const WCHAR *family;
+} systemfamily_alias_targets[] =
+{
+    { L"DejaVu Sans" },
+    { L"Liberation Sans" },
+    { L"Noto Sans" },
+    { L"Liberation Serif" },
+    { L"Times New Roman" },
+};
+
+static BOOL systemfamily_is_alias_name(const WCHAR *name)
+{
+    UINT32 i;
+
+    for (i = 0; i < ARRAY_SIZE(systemfamily_alias_names); ++i)
+        if (family_names_match_insensitive(systemfamily_alias_names[i].alias, name))
+            return TRUE;
+
+    return FALSE;
+}
+
+/* The preferred-target resolution runs under the collection section (the same one
+   serializing the seed hydration), at most once per system view; an empty view is
+   never cached - the seed machinery may still fill it on a later entry read. */
+static UINT32 collection_resolve_alias_target(struct dwrite_fontcollection *collection)
+{
+    UINT32 target = ~0u;
+
+    EnterCriticalSection(&collection->cs);
+
+    if (!collection->alias_target_cached && collection->count)
+    {
+        UINT32 i;
+
+        for (i = 0; i < ARRAY_SIZE(systemfamily_alias_targets); ++i)
+        {
+            target = collection_find_family_insensitive(collection, systemfamily_alias_targets[i].family);
+            if (target != ~0u)
+                break;
+        }
+
+        /* No preferred target is resident: the standing first family wins. */
+        if (target == ~0u)
+            target = 0;
+
+        collection->alias_target_index = target;
+        collection->alias_target_cached = TRUE;
+    }
+
+    if (collection->alias_target_cached)
+        target = collection->alias_target_index;
+
+    LeaveCriticalSection(&collection->cs);
+
+    return target;
+}
+
 static UINT32 collection_find_family(struct dwrite_fontcollection *collection, const WCHAR *name)
 {
     size_t i;
@@ -3545,6 +3696,43 @@ static HRESULT WINAPI dwritefontcollection_FindFamilyName(IDWriteFontCollection3
 
     *index = collection_find_family(collection, name);
     *exists = *index != ~0u;
+
+    /* The documented DirectWrite family-name search is case-insensitive: when the scan
+       above is about to miss, re-scan the family list with the locale-invariant
+       caseless compare before the miss is reported - a lower-cased query never leaves
+       an exists=FALSE behind while the family it names is resident. */
+    if (!*exists)
+    {
+        UINT32 ci_index = collection_find_family_insensitive(collection, name);
+
+        if (ci_index != ~0u)
+        {
+            TRACE("SEAL: FindFamilyName ci-hit '%s' -> idx %d\n", debugstr_w(name), ci_index);
+            *index = ci_index;
+            *exists = TRUE;
+        }
+    }
+
+    /* The product-name alias layer, second (system collection views only): a query
+       naming a Windows product family the collection does not install resolves
+       through the cached preferred-target family instead of trailing an exists=FALSE
+       miss that poisons the caller's negative font cache; the standing index-0
+       fallback keeps the resolution total, so a miss leaves the reply exactly as
+       it was before. */
+    if (!*exists && collection->is_system && collection->count && systemfamily_is_alias_name(name))
+    {
+        UINT32 alias_target = collection_resolve_alias_target(collection);
+
+        if (alias_target != ~0u)
+        {
+            WCHAR famname[255];
+
+            TRACE("SEAL: FindFamilyName alias '%s' -> '%s' idx=%d\n", debugstr_w(name),
+                    debugstr_w(fontfamily_name_for_trace(collection->family_data[alias_target], famname)), alias_target);
+            *index = alias_target;
+            *exists = TRUE;
+        }
+    }
 
     if (!*exists)
         TRACE("NULLREPLY: FindFamilyName miss fam=%s families=%Iu.\n", debugstr_w(name), collection->count);
