@@ -1415,6 +1415,8 @@ static HRESULT WINAPI dwritefactory1_GetEudcFontCollection(IDWriteFactory7 *ifac
             IDWriteFontCollection3_Release(eudc_collection);
     }
 
+    /* Both attempts lost the handout race: the out-param must not carry a stale caller value. */
+    *collection = NULL;
     return E_FAIL;
 }
 
