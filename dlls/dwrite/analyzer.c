@@ -2539,6 +2539,27 @@ static UINT32 fallback_font_get_supported_length(IDWriteFont3 *font, IDWriteText
     return mapped;
 }
 
+/* The mapping found no family (or no collection) that resolves the input to a real font: hand
+   the pinned default font out instead of a NULL out-param, so a caller that doesn't check the
+   status never trips over a NULL font carrier. */
+static HRESULT fallback_hand_default_font(const struct dwrite_fontfallback *fallback, IDWriteFont **ret_font,
+        float *scale)
+{
+    IDWriteFont3 *font;
+    HRESULT hr;
+
+    if (SUCCEEDED(hr = dwrite_get_default_font(fallback->factory, &IID_IDWriteFont3, (void **)&font)))
+    {
+        *ret_font = (IDWriteFont *)font;
+        *scale = 1.0f;
+        return S_OK;
+    }
+
+    /* Degenerate: no font objects could be built at all. */
+    *ret_font = NULL;
+    return hr;
+}
+
 static HRESULT fallback_map_characters(const struct dwrite_fontfallback *fallback, IDWriteTextAnalysisSource *source,
         UINT32 position, UINT32 text_length, DWRITE_FONT_WEIGHT weight, DWRITE_FONT_STYLE style,
         DWRITE_FONT_STRETCH stretch, IDWriteFont **ret_font, UINT32 *ret_length, float *scale)
@@ -2581,10 +2602,9 @@ static HRESULT fallback_map_characters(const struct dwrite_fontfallback *fallbac
 
     if (!mapping)
     {
-        *ret_font = NULL;
         *ret_length = mapped;
 
-        return S_OK;
+        return fallback_hand_default_font(fallback, ret_font, scale);
     }
 
     /* Go through families in the mapping, use first family that supports some of the input. The
@@ -2593,9 +2613,8 @@ static HRESULT fallback_map_characters(const struct dwrite_fontfallback *fallbac
 
     if (!collection)
     {
-        *ret_font = NULL;
         *ret_length = length;
-        return S_OK;
+        return fallback_hand_default_font(fallback, ret_font, scale);
     }
 
     for (i = 0; i < mapping->families_count; ++i)
@@ -2616,11 +2635,12 @@ static HRESULT fallback_map_characters(const struct dwrite_fontfallback *fallbac
         }
     }
 
-    /* Mapping was found, but either font couldn't be created or there's no font that supports given input. */
-    *ret_font = NULL;
+    /* Mapping was found, but either font couldn't be created or there's no font that supports
+       given input.  The terminal state still resolves to a bound font: the pinned default
+       font is handed out instead of a NULL out-param. */
     *ret_length = length;
 
-    return S_OK;
+    return fallback_hand_default_font(fallback, ret_font, scale);
 }
 
 HRESULT create_matching_font(IDWriteFontCollection *collection, const WCHAR *name, DWRITE_FONT_WEIGHT weight,
