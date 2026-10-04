@@ -123,6 +123,12 @@ static struct cache_entry * fontface_get_cache_entry(struct dwrite_fontface *fon
     return entry;
 }
 
+/* The ft face object a face use goes through: face resolution materializes the object
+   lazily on first use, and a wrapper whose ft face failed to build leaves every metric or
+   glyph call dereferencing object 0 - uses resolve a dead carrier to the family's pinned
+   face object instead (same handout semantics as the font resolution routes). */
+static UINT64 fontface_font_object_or_default(struct dwrite_fontface *fontface);
+
 static int fontface_get_glyph_advance(struct dwrite_fontface *fontface, float fontsize, unsigned short glyph,
         unsigned short mode, BOOL *has_contours)
 {
@@ -138,7 +144,7 @@ static int fontface_get_glyph_advance(struct dwrite_fontface *fontface, float fo
 
     if (!entry->has_advance)
     {
-        params.object = fontface->get_font_object(fontface);
+        params.object = fontface_font_object_or_default(fontface);
         params.glyph = glyph;
         params.mode = mode;
         params.emsize = fontsize;
@@ -162,7 +168,7 @@ void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *iface, struct dwrite_glyphb
     struct get_glyph_bbox_params params;
     struct cache_entry *entry;
 
-    params.object = fontface->get_font_object(fontface);
+    params.object = fontface_font_object_or_default(fontface);
     params.simulations = bitmap->simulations;
     params.glyph = bitmap->glyph;
     params.emsize = bitmap->emsize;
@@ -206,7 +212,7 @@ static HRESULT dwrite_fontface_get_glyph_bitmap(struct dwrite_fontface *fontface
     bitmap_size = get_glyph_bitmap_pitch(rendering_mode, bbox->right - bbox->left) *
             (bbox->bottom - bbox->top);
 
-    params.object = fontface->get_font_object(fontface);
+    params.object = fontface_font_object_or_default(fontface);
     params.simulations = fontface->simulations;
     params.glyph = bitmap->glyph;
     params.mode = rendering_mode;
@@ -1003,7 +1009,7 @@ static UINT16 WINAPI dwritefontface_GetGlyphCount(IDWriteFontFace5 *iface)
 
     TRACE("%p.\n", iface);
 
-    params.object = fontface->get_font_object(fontface);
+    params.object = fontface_font_object_or_default(fontface);
     params.count = &count;
     UNIX_CALL(get_glyph_count, &params);
 
@@ -1027,7 +1033,7 @@ static HRESULT WINAPI dwritefontface_GetDesignGlyphMetrics(IDWriteFontFace5 *ifa
     if (is_sideways)
         FIXME("sideways metrics are not supported.\n");
 
-    params.object = fontface->get_font_object(fontface);
+    params.object = fontface_font_object_or_default(fontface);
     params.simulations = fontface->simulations;
     params.upem = fontface->metrics.designUnitsPerEm;
     params.ascent = fontface->typo_metrics.ascent;
@@ -1150,7 +1156,7 @@ static HRESULT WINAPI dwritefontface_GetGlyphRunOutline(IDWriteFontFace5 *iface,
     memset(&outline_size, 0, sizeof(outline_size));
     memset(&outline, 0, sizeof(outline));
 
-    params.object = fontface->get_font_object(fontface);
+    params.object = fontface_font_object_or_default(fontface);
     params.simulations = fontface->simulations;
     params.emsize = emSize;
 
@@ -5075,6 +5081,7 @@ static struct dwrite_fontface *default_fontface; /* pinned for the process lifet
 
 static BOOL WINAPI default_fontface_initonce(INIT_ONCE *once, void *param, void **context)
 {
+    struct dwrite_fontface *fontface;
     IDWriteFontFace5 *fontface5;
     HRESULT hr;
 
@@ -5084,7 +5091,21 @@ static BOOL WINAPI default_fontface_initonce(INIT_ONCE *once, void *param, void 
         return FALSE;
     }
 
-    default_fontface = impl_from_IDWriteFontFace5(fontface5);
+    fontface = impl_from_IDWriteFontFace5(fontface5);
+
+    /* Pin the ft face object together with the wrapper: the pinned carrier backs every
+       face use that would otherwise dereference object 0 (a wrapper whose ft face failed
+       to build), and it is never released for the process lifetime - any family whose
+       resolution reaches a dead carrier hands this object out, and the carrier stays
+       alive through teardown bursts because the object itself is pinned. */
+    if (!dwrite_fontface_check_font_object(&fontface->IDWriteFontFace5_iface))
+    {
+        WARN("Failed to materialize the default font face object.\n");
+        IDWriteFontFace5_Release(fontface5);
+        return FALSE;
+    }
+
+    default_fontface = fontface;
     return TRUE;
 }
 
@@ -5102,6 +5123,21 @@ HRESULT dwrite_get_default_fontface(IDWriteFactory7 *factory, REFIID riid, void 
     }
 
     return IDWriteFontFace5_QueryInterface(&default_fontface->IDWriteFontFace5_iface, riid, obj);
+}
+
+/* The ft face object a face use computes against: a wrapper whose ft face object failed to
+   build would be dereferenced with object 0 inside the ft layer on every metric or glyph
+   call.  A face use that reaches a dead carrier resolves it to the family's pinned face
+   object instead - the process default face materialized at pin time and never released,
+   so the object handed to the ft layer is always valid, never a stale pointer. */
+static UINT64 fontface_font_object_or_default(struct dwrite_fontface *fontface)
+{
+    UINT64 object = fontface->get_font_object(fontface);
+
+    if (!object && default_fontface)
+        object = default_fontface->get_font_object(default_fontface);
+
+    return object;
 }
 
 static HRESULT eudc_collection_add_family(IDWriteFactory7 *factory, struct dwrite_fontcollection *collection,
@@ -5531,8 +5567,20 @@ HRESULT create_fontface(const struct fontface_desc *desc, struct list *cached_li
     IDWriteFontFileStream_AddRef(fontface->cmap.stream);
     release_font_data(font_data);
 
-    fontface->cached = factory_cache_fontface(fontface->factory, cached_list, &fontface->IDWriteFontFace5_iface);
+    /* Resolution-time face materialization: the wrapper materializes its ft face object
+       before it enters a cached slot or reaches a caller, so a resolution reports a face
+       whose object actually exists.  A wrapper whose ft face failed to build (invalid
+       file, dead stream) would carry object 0 into every metric or glyph call - report
+       the failure to the resolution routes, which hand the family's pinned face object
+       out instead of a dead carrier. */
     fontface->get_font_object = dwrite_fontface_get_font_object;
+    if (!fontface->get_font_object(fontface))
+    {
+        IDWriteFontFace5_Release(&fontface->IDWriteFontFace5_iface);
+        return DWRITE_E_NOFONT;
+    }
+
+    fontface->cached = factory_cache_fontface(fontface->factory, cached_list, &fontface->IDWriteFontFace5_iface);
 
     *ret = &fontface->IDWriteFontFace5_iface;
 
