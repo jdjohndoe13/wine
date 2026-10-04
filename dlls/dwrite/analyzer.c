@@ -2470,19 +2470,42 @@ static HRESULT WINAPI fontfallback_QueryInterface(IDWriteFontFallback1 *iface, R
 static ULONG WINAPI fontfallback_AddRef(IDWriteFontFallback1 *iface)
 {
     struct dwrite_fontfallback *fallback = impl_from_IDWriteFontFallback1(iface);
+    ULONG refcount = InterlockedIncrement(&fallback->refcount);
 
-    TRACE("%p.\n", iface);
+    TRACE("%p, refcount %lu.\n", iface, refcount);
 
-    return IDWriteFactory7_AddRef(fallback->factory);
+    /* Keep the factory referenced for the duration of each external reference. */
+    IDWriteFactory7_AddRef(fallback->factory);
+
+    return refcount;
 }
 
 static ULONG WINAPI fontfallback_Release(IDWriteFontFallback1 *iface)
 {
     struct dwrite_fontfallback *fallback = impl_from_IDWriteFontFallback1(iface);
+    ULONG refcount = InterlockedDecrement(&fallback->refcount);
 
-    TRACE("%p.\n", fallback);
+    TRACE("%p, refcount %lu.\n", iface, refcount);
 
-    return IDWriteFactory7_Release(fallback->factory);
+    if (refcount)
+    {
+        IDWriteFactory7_Release(fallback->factory);
+        return refcount;
+    }
+
+    if (factory_detach_system_fontfallback(fallback->factory, fallback, &fallback->refcount))
+    {
+        if (fallback->systemcollection)
+            IDWriteFontCollection_Release(fallback->systemcollection);
+        IDWriteFactory7_Release(fallback->factory);
+        free(fallback);
+        return 0;
+    }
+
+    /* A concurrent GetSystemFontFallback() handed the instance out between the
+       final decrement and the cache lock; the new owner will release it. */
+    IDWriteFactory7_Release(fallback->factory);
+    return InterlockedCompareExchange(&fallback->refcount, 0, 0);
 }
 
 static inline BOOL fallback_is_uvs(const struct text_source_context *context)
@@ -2525,6 +2548,7 @@ static HRESULT fallback_map_characters(const struct dwrite_fontfallback *fallbac
     const struct fallback_data *data;
     const WCHAR *locale_name = NULL;
     struct fallback_locale *locale;
+    IDWriteFontCollection *collection;
     UINT32 i, length = 0, mapped;
     IDWriteFont3 *font;
     HRESULT hr;
@@ -2563,11 +2587,21 @@ static HRESULT fallback_map_characters(const struct dwrite_fontfallback *fallbac
         return S_OK;
     }
 
-    /* Go through families in the mapping, use first family that supports some of the input. */
+    /* Go through families in the mapping, use first family that supports some of the input. The
+       system collection may be absent if its creation failed. */
+    collection = mapping->collection ? mapping->collection : fallback->systemcollection;
+
+    if (!collection)
+    {
+        *ret_font = NULL;
+        *ret_length = length;
+        return S_OK;
+    }
+
     for (i = 0; i < mapping->families_count; ++i)
     {
-        if (SUCCEEDED(create_matching_font(mapping->collection ? mapping->collection : fallback->systemcollection,
-                mapping->families[i], weight, style, stretch, &IID_IDWriteFont3, (void **)&font)))
+        if (SUCCEEDED(create_matching_font(collection, mapping->families[i], weight, style, stretch,
+                &IID_IDWriteFont3, (void **)&font)))
         {
             if (!(*ret_length = fallback_font_get_supported_length(font, source, position, mapped)))
             {
@@ -2688,7 +2722,8 @@ static const IDWriteFontFallback1Vtbl fontfallbackvtbl =
 void release_system_fontfallback(IDWriteFontFallback1 *iface)
 {
     struct dwrite_fontfallback *fallback = impl_from_IDWriteFontFallback1(iface);
-    IDWriteFontCollection_Release(fallback->systemcollection);
+    if (fallback->systemcollection)
+        IDWriteFontCollection_Release(fallback->systemcollection);
     free(fallback);
 }
 
@@ -3157,7 +3192,11 @@ HRESULT create_system_fontfallback(IDWriteFactory7 *factory, IDWriteFontFallback
     fallback->IDWriteFontFallback1_iface.lpVtbl = &fontfallbackvtbl;
     fallback->factory = factory;
     fallback->data.count = ~0u;
-    IDWriteFactory_GetSystemFontCollection((IDWriteFactory *)fallback->factory, &fallback->systemcollection, FALSE);
+    if (FAILED(IDWriteFactory_GetSystemFontCollection((IDWriteFactory *)fallback->factory, &fallback->systemcollection, FALSE)))
+    {
+        WARN("Failed to get system font collection for the fallback.\n");
+        fallback->systemcollection = NULL;
+    }
 
     *ret = &fallback->IDWriteFontFallback1_iface;
 
