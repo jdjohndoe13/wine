@@ -3446,6 +3446,18 @@ static HRESULT WINAPI dwritefontcollection_FindFamilyName(IDWriteFontCollection3
     if (!collection->count && collection->is_system)
         fontcollection_ensure_seed_families(collection);
 
+    /* The unset or empty family-name request is the "default family" lookup: on a system
+       view it resolves to the standing first family deterministically (the catalogued
+       seed head when the view was seeded, otherwise the first real scan family) instead
+       of trailing to a hard miss - a caller holding an empty name always resolves a
+       family whose matching hands out a loadable font, never a null exists-return. */
+    if (collection->is_system && collection->count && (!name || !*name))
+    {
+        *index = 0;
+        *exists = TRUE;
+        return S_OK;
+    }
+
     *index = collection_find_family(collection, name);
     *exists = *index != ~0u;
     return S_OK;
@@ -5043,7 +5055,7 @@ static BOOL fontcollection_seed_fallback_family(struct dwrite_fontcollection *co
         UINT32 face_count, const WCHAR *name)
 {
     struct dwrite_fontfamily_data *family_data;
-    IDWriteLocalizedStrings *familyname;
+    IDWriteLocalizedStrings *familyname, *alias;
     struct dwrite_font_data *font_data;
     UINT32 i;
     HRESULT hr;
@@ -5072,6 +5084,21 @@ static BOOL fontcollection_seed_fallback_family(struct dwrite_fontcollection *co
 
         if (FAILED(init_font_data(&desc, collection->family_model, &font_data)))
             continue;
+
+        /* Face-level name gate: a seed slot is the alias the collection was catalogued
+           under - every face built from it announces that exact family name the matching
+           route resolved through, not the backing file's own name, so a resolution
+           through the seeded family survives downstream case-insensitive localized-name
+           checks on the font and the face it hands out.  The face's style, weight and
+           stretch still come from the source face descriptors. */
+        alias = NULL;
+        if (FAILED(clone_localizedstrings(family_data->familyname, &alias)))
+        {
+            release_font_data(font_data);
+            continue;
+        }
+        IDWriteLocalizedStrings_Release(font_data->family_names);
+        font_data->family_names = alias;
 
         if (FAILED(fontfamily_add_font(family_data, font_data)))
             release_font_data(font_data);
