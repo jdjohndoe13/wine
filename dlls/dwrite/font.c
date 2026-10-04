@@ -352,6 +352,8 @@ struct dwrite_fontcollection
     struct dwrite_fontfamily_data **family_data;
     size_t size;
     size_t count;
+    BOOL is_system;
+    CRITICAL_SECTION cs; /* serializes the entry-instant seed hydration on reads */
 
     struct
     {
@@ -3343,11 +3345,21 @@ static ULONG WINAPI dwritefontcollection_Release(IDWriteFontCollection3 *iface)
         for (i = 0; i < collection->set.count; ++i)
             release_fontset_entry(collection->set.entries[i]);
         free(collection->family_data);
+        DeleteCriticalSection(&collection->cs);
         free(collection);
     }
 
     return refcount;
 }
+
+/* The fresh-factory entry-instant seed hydration on reads: any factory-instantiated
+   system collection read with a still-empty family table re-attempts the catalogued
+   seed fill synchronously under the collection section - enumeration callers never
+   walk a collapsed zero-family view, and a collection hydrated empty at build time
+   (a fresh factory whose streams could not open yet) heals on the first read after
+   the resident files become openable.  Seeding only appends to the family table,
+   the view never shrinks back to zero. */
+static void fontcollection_ensure_seed_families(struct dwrite_fontcollection *collection);
 
 /* The family-count view callers enumerate through: a collection's family list is an
    immutable snapshot materialized at build time (from the factory's system set, which
@@ -3359,6 +3371,12 @@ static UINT32 WINAPI dwritefontcollection_GetFontFamilyCount(IDWriteFontCollecti
     struct dwrite_fontcollection *collection = impl_from_IDWriteFontCollection3(iface);
 
     TRACE("%p.\n", iface);
+
+    /* The entry-instant read contract: a fresh system view with a still-empty family
+       table hydrates from the catalogued seed before the count is served - the
+       fresh-factory window never reports a zero family count from a resident view. */
+    if (!collection->count && collection->is_system)
+        fontcollection_ensure_seed_families(collection);
 
     return collection->count;
 }
@@ -3373,6 +3391,12 @@ static HRESULT WINAPI dwritefontcollection_GetFontFamily(IDWriteFontCollection3 
     TRACE("%p, %u, %p.\n", iface, index, ret);
 
     *ret = NULL;
+
+    /* Same entry-instant read contract as the family count above: a valid index on a
+       fresh collection whose table is still empty hydrates from the catalogued seed
+       first, so the family the caller enumerates is never left unresolved. */
+    if (!collection->count && collection->is_system)
+        fontcollection_ensure_seed_families(collection);
 
     if (index >= collection->count)
         return E_FAIL;
@@ -3413,6 +3437,14 @@ static HRESULT WINAPI dwritefontcollection_FindFamilyName(IDWriteFontCollection3
     struct dwrite_fontcollection *collection = impl_from_IDWriteFontCollection3(iface);
 
     TRACE("%p, %s, %p, %p.\n", iface, debugstr_w(name), index, exists);
+
+    /* The find route on a fresh factory: a family missing from the live table is
+       resolved through the catalogued seed set first (the ladder families plus the
+       @font-face alias) - the lookup never walks an unresolved zero-family view;
+       only a view that genuinely has no loadable font material to seed from still
+       reports the miss. */
+    if (!collection->count && collection->is_system)
+        fontcollection_ensure_seed_families(collection);
 
     *index = collection_find_family(collection, name);
     *exists = *index != ~0u;
@@ -3532,6 +3564,9 @@ static HRESULT WINAPI dwritefontcollection1_GetFontFamily(IDWriteFontCollection3
 
     *ret = NULL;
 
+    if (!collection->count && collection->is_system)
+        fontcollection_ensure_seed_families(collection);
+
     if (index >= collection->count)
         return E_FAIL;
 
@@ -3551,6 +3586,9 @@ static HRESULT WINAPI dwritefontcollection2_GetFontFamily(IDWriteFontCollection3
     TRACE("%p, %u, %p.\n", iface, index, ret);
 
     *ret = NULL;
+
+    if (!collection->count && collection->is_system)
+        fontcollection_ensure_seed_families(collection);
 
     if (index >= collection->count)
         return E_FAIL;
@@ -3652,6 +3690,8 @@ static void init_font_collection(struct dwrite_fontcollection *collection, IDWri
     collection->factory = factory;
     IDWriteFactory7_AddRef(collection->factory);
     collection->family_model = family_model;
+    collection->is_system = FALSE;
+    InitializeCriticalSection(&collection->cs);
 }
 
 HRESULT get_filestream_from_file(IDWriteFontFile *file, IDWriteFontFileStream **stream)
@@ -4891,6 +4931,10 @@ HRESULT create_font_collection_from_set(IDWriteFactory7 *factory, IDWriteFontSet
 
     init_font_collection(collection, factory, family_model);
 
+    /* The entry-instant read contract applies only to system collection views: custom
+       and EUDC collections keep their exact standing build behavior. */
+    collection->is_system = set->is_system;
+
     collection->set.count = set->count;
     for (i = 0; i < set->count; ++i)
     {
@@ -4970,18 +5014,28 @@ static HRESULT create_local_file_reference(IDWriteFactory7 *factory, const WCHAR
 
 /* Catalogued minimal family set a system collection view is seeded with when it
    would otherwise surface with zero families (every entry failed to hydrate, or
-   the system set scan itself came back empty in an engine restart window).
-   Blink-style enumeration callers - SkFontMgr_DirectWrite countFamilies() and the
-   last-resort family ladder - must never walk a collapsed zero-family view. */
+   the system set scan itself came back empty in an engine restart window), or
+   lazily on a read when the view is still empty at the entry instant.
+   The first nine names are the last-resort family ladder Skia's SkFontMgr_DirectWrite
+   resolves fresh-factory enumerations through; Tahoma and Microsoft Sans Serif are
+   preserved from the round-7 seed catalog (both are behind the analyzer fallback
+   routes); 'Font Awesome 6 Free' is the @font-face family name the Dr.Explain
+   preview temp resolves through - a fresh view seed never leaves its resolve-miss
+   unanswered, the family slot hands out real, loadable faces. */
 static const WCHAR *const fallback_families_catalog[] =
 {
     L"Segoe UI",
     L"Arial",
-    L"Microsoft Sans Serif",
-    L"Tahoma",
     L"Times New Roman",
+    L"Trebuchet MS",
     L"Courier New",
     L"Calibri",
+    L"Impact",
+    L"Georgia",
+    L"Comic Sans MS",
+    L"Microsoft Sans Serif",
+    L"Tahoma",
+    L"Font Awesome 6 Free",
 };
 
 static BOOL fontcollection_seed_fallback_family(struct dwrite_fontcollection *collection,
@@ -5114,6 +5168,38 @@ static void fontcollection_seed_fallback_families(struct dwrite_fontcollection *
         TRACE("Seeded catalogued fallback families for an empty system collection.\n");
 }
 
+/* The read-level entry-instant hydration (see the forward declaration at the collection
+   read methods): re-runs the catalogued seed fill for a still-empty system view and
+   applies the same simulated-face treatment the build path gives its families.  Runs
+   under the collection section, which serializes concurrent fresh-view readers. */
+static void fontcollection_ensure_seed_families(struct dwrite_fontcollection *collection)
+{
+    size_t i;
+
+    EnterCriticalSection(&collection->cs);
+
+    /* double-check under the section: a concurrent reader may have hydrated meanwhile */
+    if (!collection->count)
+    {
+        fontcollection_seed_fallback_families(collection);
+
+        if (collection->count)
+        {
+            if (collection->family_model == DWRITE_FONT_FAMILY_MODEL_WEIGHT_STRETCH_STYLE)
+            {
+                for (i = 0; i < collection->count; ++i)
+                {
+                    fontfamily_add_bold_simulated_face(collection->family_data[i]);
+                    fontfamily_add_oblique_simulated_face(collection->family_data[i]);
+                }
+            }
+            TRACE("Hydrated catalogued seed families on read, %Iu families.\n", collection->count);
+        }
+    }
+
+    LeaveCriticalSection(&collection->cs);
+}
+
 HRESULT get_system_fontcollection(IDWriteFactory7 *factory, DWRITE_FONT_FAMILY_MODEL family_model,
         IDWriteFontCollection **collection)
 {
@@ -5129,6 +5215,114 @@ HRESULT get_system_fontcollection(IDWriteFactory7 *factory, DWRITE_FONT_FAMILY_M
     }
 
     return hr;
+}
+
+static HRESULT fontset_create_entry(IDWriteFontFile *file, DWRITE_FONT_FACE_TYPE face_type,
+        unsigned int face_index, unsigned int simulations, struct dwrite_fontset_entry **ret);
+
+/* The fresh-factory entry-instant hydration for the FACTORY system table: resolves the
+   first loadable resident system font file and materializes one fontset entry per face
+   of it, away from the factory table (same contract as the rebuild).  create_system_fontset
+   installs the content when a fresh factory's build/rebuild attempt has left its standing
+   table empty - the pre-build site of the first GetSystemFontCollection fetch serves a
+   hydrated table instead of an empty one.  The caller owns the returned entries. */
+HRESULT system_fontset_seed_entries(IDWriteFactory7 *factory, struct dwrite_fontset_entry ***ret,
+        unsigned int *ret_count)
+{
+    struct dwrite_fontset_entry **entries;
+    DWRITE_FONT_FILE_TYPE file_type;
+    DWRITE_FONT_FACE_TYPE face_type;
+    IDWriteFontFileStream *stream;
+    IDWriteFontFile *file;
+    WCHAR **paths;
+    unsigned int i, count, entry_count;
+    UINT32 face_count;
+    BOOL materialized = FALSE;
+    HRESULT hr = S_OK;
+
+    *ret = NULL;
+    *ret_count = 0;
+
+    if (FAILED(create_system_path_list(&paths, &count)))
+    {
+        WARN("Failed to list resident system fonts, ignoring.\n");
+        return E_UNEXPECTED;
+    }
+
+    stream = NULL;
+    file = NULL;
+    for (i = 0; i < count && !materialized; ++i)
+    {
+        BOOL supported;
+
+        if (FAILED(create_local_file_reference(factory, paths[i], &file)))
+            continue;
+
+        if (FAILED(get_filestream_from_file(file, &stream)))
+        {
+            IDWriteFontFile_Release(file);
+            file = NULL;
+            continue;
+        }
+
+        if (SUCCEEDED(opentype_analyze_font(stream, &supported, &file_type, &face_type, &face_count))
+                && supported && face_count)
+        {
+            materialized = TRUE;
+            TRACE("Hydrating the fresh factory system table from %s (file type %u).\n",
+                    debugstr_w(paths[i]), file_type);
+        }
+        else
+        {
+            IDWriteFontFileStream_Release(stream);
+            IDWriteFontFile_Release(file);
+            stream = NULL;
+            file = NULL;
+        }
+    }
+
+    for (i = 0; i < count; ++i)
+        free(paths[i]);
+    free(paths);
+
+    if (!materialized)
+    {
+        WARN("No resident loadable system font file to hydrate the fresh factory system table from.\n");
+        return E_FAIL;
+    }
+
+    if (!(entries = calloc(face_count, sizeof(*entries))))
+    {
+        IDWriteFontFileStream_Release(stream);
+        IDWriteFontFile_Release(file);
+        return E_OUTOFMEMORY;
+    }
+
+    entry_count = 0;
+    for (i = 0; i < face_count; ++i)
+    {
+        struct dwrite_fontset_entry *entry;
+
+        if (FAILED(hr = fontset_create_entry(file, face_type, i, DWRITE_FONT_SIMULATIONS_NONE, &entry)))
+            break;
+        entries[entry_count++] = entry;
+    }
+
+    IDWriteFontFileStream_Release(stream);
+    IDWriteFontFile_Release(file);
+
+    if (FAILED(hr) || !entry_count)
+    {
+        for (i = 0; i < entry_count; ++i)
+            release_fontset_entry(entries[i]);
+        free(entries);
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+
+    *ret = entries;
+    *ret_count = entry_count;
+
+    return S_OK;
 }
 
 /* Process-wide pinned default font used by font resolution routes: whenever a requested family,
