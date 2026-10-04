@@ -724,10 +724,33 @@ static struct collectionloader *factory_get_collection_loader(struct dwritefacto
     return found;
 }
 
+/* Fetch a cached system collection: the cached slot may be cleared concurrently
+   (factory_detach_fontcollection(), factory teardown), so read it atomically, pin the
+   instance, and verify the slot still holds that same instance before handing it out. */
+static IDWriteFontCollection *factory_fetch_cached_collection(struct dwritefactory *factory,
+        DWRITE_FONT_FAMILY_MODEL family_model)
+{
+    IDWriteFontCollection *collection;
+
+    if (!(collection = InterlockedCompareExchangePointer((void **)&factory->system_collections[family_model], NULL, NULL)))
+        return NULL;
+
+    IDWriteFontCollection_AddRef(collection);
+
+    if (InterlockedCompareExchangePointer((void **)&factory->system_collections[family_model], collection, collection) == collection)
+        return collection;
+
+    /* The instance was detached concurrently; the pin just taken keeps it alive
+       while the reference is dropped. */
+    IDWriteFontCollection_Release(collection);
+    return NULL;
+}
+
 static HRESULT factory_get_system_collection(struct dwritefactory *factory,
         DWRITE_FONT_FAMILY_MODEL family_model, REFIID riid, void **out)
 {
     IDWriteFontCollection *collection;
+    unsigned int attempt;
     HRESULT hr;
 
     *out = NULL;
@@ -738,21 +761,27 @@ static HRESULT factory_get_system_collection(struct dwritefactory *factory,
         return E_INVALIDARG;
     }
 
-    if (factory->system_collections[family_model])
-        return IDWriteFontCollection_QueryInterface(factory->system_collections[family_model], riid, out);
-
-    if (FAILED(hr = get_system_fontcollection(&factory->IDWriteFactory7_iface, family_model, &collection)))
+    /* Two attempts: a freshly stored cache entry can still be detached before the handout. */
+    for (attempt = 0; attempt < 2; ++attempt)
     {
-        WARN("Failed to create system font collection, hr %#lx.\n", hr);
-        return hr;
+        if ((collection = factory_fetch_cached_collection(factory, family_model)))
+        {
+            hr = IDWriteFontCollection_QueryInterface(collection, riid, out);
+            IDWriteFontCollection_Release(collection);
+            return hr;
+        }
+
+        if (FAILED(hr = get_system_fontcollection(&factory->IDWriteFactory7_iface, family_model, &collection)))
+        {
+            WARN("Failed to create system font collection, hr %#lx.\n", hr);
+            return hr;
+        }
+
+        if (InterlockedCompareExchangePointer((void **)&factory->system_collections[family_model], collection, NULL))
+            IDWriteFontCollection_Release(collection);
     }
 
-    if (InterlockedCompareExchangePointer((void **)&factory->system_collections[family_model], collection, NULL))
-        IDWriteFontCollection_Release(collection);
-
-    hr = IDWriteFontCollection_QueryInterface(factory->system_collections[family_model], riid, out);
-    IDWriteFontCollection_Release(factory->system_collections[family_model]);
-    return hr;
+    return E_FAIL;
 }
 
 static HRESULT WINAPI dwritefactory_QueryInterface(IDWriteFactory7 *iface, REFIID riid, void **obj)
