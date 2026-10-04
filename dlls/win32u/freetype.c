@@ -1689,6 +1689,7 @@ static UINT freetype_get_font_data( struct gdi_font *font, UINT table, UINT offs
     FT_ULong len;
     FT_Error err;
 
+    if (!ft_face) return GDI_ERROR;
     if (!FT_IS_SFNT(ft_face)) return GDI_ERROR;
 
     if(!buf)
@@ -2056,7 +2057,6 @@ static BOOL freetype_load_font( struct gdi_font *font )
     SIZE_T data_size;
 
     if (!(data = calloc( 1, sizeof(*data) ))) return FALSE;
-    font->private = data;
 
     if (font->file[0])
     {
@@ -2069,6 +2069,7 @@ static BOOL freetype_load_font( struct gdi_font *font )
         if (!data->mapping)
         {
             WARN("failed to map %s\n", debugstr_w(font->file));
+            free( data );
             return FALSE;
         }
         data_ptr = data->mapping->data;
@@ -2080,9 +2081,18 @@ static BOOL freetype_load_font( struct gdi_font *font )
         data_size = font->data_size;
     }
 
-    if (pFT_New_Memory_Face( library, data_ptr, data_size, font->face_index, &ft_face )) return FALSE;
+    if (pFT_New_Memory_Face( library, data_ptr, data_size, font->face_index, &ft_face ))
+    {
+        if (data->mapping) unmap_font_file( data->mapping );
+        free( data );
+        return FALSE;
+    }
 
+    /* the private carrier is installed only together with a live ft face
+       object, so a failed load leaves the gdi font with a null private and
+       the lazy-load routes retry the load instead of using a dead carrier */
     data->ft_face = ft_face;
+    font->private = data;
     font->scalable = FT_IS_SCALABLE( ft_face );
     if (!font->fs.fsCsb[0]) get_fontsig( ft_face, &font->fs );
     if (!font->ntmFlags) font->ntmFlags = get_ntm_flags( ft_face );
@@ -2168,6 +2178,7 @@ static FT_UInt get_glyph_index_symbol( struct gdi_font *font, UINT glyph )
     FT_Face ft_face = get_ft_face( font );
     FT_UInt ret;
 
+    if (!ft_face) return 0;
     if (glyph < 0x100) glyph += 0xf000;
     /* there are a number of old pre-Unicode "broken" TTFs, which
        do have symbols at U+00XX instead of U+f0XX */
@@ -2184,6 +2195,7 @@ static BOOL freetype_get_glyph_index( struct gdi_font *font, UINT *glyph, BOOL u
 {
     FT_Face ft_face = get_ft_face( font );
 
+    if (!ft_face) return FALSE;
     if (!use_encoding ^ (ft_face->charmap->encoding == FT_ENCODING_NONE)) return FALSE;
 
     if (ft_face->charmap->encoding == FT_ENCODING_MS_SYMBOL)
@@ -2212,6 +2224,7 @@ static UINT freetype_get_default_glyph( struct gdi_font *font )
     FT_WinFNT_HeaderRec winfnt;
     TT_OS2 *pOS2;
 
+    if (!ft_face) return 0;
     if ((pOS2 = pFT_Get_Sfnt_Table( ft_face, ft_sfnt_os2 )))
     {
         UINT glyph = pOS2->usDefaultChar;
@@ -3107,6 +3120,8 @@ static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT 
     FT_Matrix transform_matrices[3], *matrices = NULL;
     BOOL vertical_metrics;
 
+    if (!ft_face) return GDI_ERROR;
+
     TRACE("%p, %04x, %08x, %p, %08x, %p, %p\n", font, glyph, format, lpgm, buflen, buf, lpmat);
 
     TRACE("font transform %f %f %f %f\n",
@@ -3244,6 +3259,7 @@ static BOOL freetype_set_bitmap_text_metrics( struct gdi_font *font )
     FT_Face ft_face = get_ft_face( font );
     FT_WinFNT_HeaderRec winfnt_header;
 
+    if (!ft_face) return FALSE;
     if (font->otm.otmSize) return TRUE;  /* already set */
     font->otm.otmSize = offsetof( OUTLINETEXTMETRICW, otmFiller );
 
@@ -3330,6 +3346,7 @@ static BOOL freetype_set_outline_text_metrics( struct gdi_font *font )
 
     TRACE("font=%p\n", font);
 
+    if (!ft_face) return FALSE;
     if (!font->scalable) return FALSE;
     if (font->otm.otmSize) return TRUE;  /* already set */
 
@@ -3589,6 +3606,7 @@ static BOOL freetype_get_char_width_info( struct gdi_font *font, struct char_wid
 
     TRACE("%p, %p\n", font, info);
 
+    if (!ft_face) return FALSE;
     if ((pHori = pFT_Get_Sfnt_Table(ft_face, ft_sfnt_hhea)))
     {
         FT_Fixed em_scale = pFT_MulDiv(font->ppem, 1 << 16, ft_face->units_per_EM);
@@ -3612,6 +3630,7 @@ static UINT freetype_get_unicode_ranges( struct gdi_font *font, GLYPHSET *gs )
     FT_Face ft_face = get_ft_face( font );
     UINT num_ranges = 0;
 
+    if (!ft_face) return 0;
     if (ft_face->charmap->encoding == FT_ENCODING_UNICODE)
     {
         FT_UInt glyph_code;
@@ -3775,6 +3794,8 @@ static UINT freetype_get_kerning_pairs( struct gdi_font *font, KERNINGPAIR **pai
     const struct TT_kern_subtable *tt_kern_subtable;
     USHORT i, nTables;
     USHORT *glyph_to_char;
+
+    if (!ft_face) return 0;
 
     length = freetype_get_font_data(font, MS_KERN_TAG, 0, NULL, 0);
 
