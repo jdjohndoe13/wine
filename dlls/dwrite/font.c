@@ -2975,6 +2975,12 @@ static BOOL is_better_font_match(const struct dwrite_font_propvec *next, const s
     return FALSE;
 }
 
+/* The read-level entry-instant hydration (see the collection read methods): a system view
+   slot that is still unresolved re-runs the catalogued seed fill through the same
+   materialization that produced the collection - the seed store re-pulls fresh every
+   time, so the family matching routes never walk a collapsed zero-slot view. */
+static void fontcollection_ensure_seed_families(struct dwrite_fontcollection *collection);
+
 static HRESULT WINAPI dwritefontfamily_GetFirstMatchingFont(IDWriteFontFamily2 *iface, DWRITE_FONT_WEIGHT weight,
         DWRITE_FONT_STRETCH stretch, DWRITE_FONT_STYLE style, IDWriteFont **font)
 {
@@ -2983,6 +2989,14 @@ static HRESULT WINAPI dwritefontfamily_GetFirstMatchingFont(IDWriteFontFamily2 *
     size_t i, match;
 
     TRACE("%p, %d, %d, %d, %p.\n", iface, weight, stretch, style, font);
+
+    /* The query route on a system view whose family slot is still unresolved: re-pull the
+       catalogued seed on demand through the same materialization that produced the
+       collection, then resolve deterministically.  A slot that carries faces falls back
+       to the nearest (weight,stretch,style) face, whose style is the actual face
+       descriptor's; a slot that still has nothing hands the pinned default font out. */
+    if (!family->data->count && family->collection->is_system)
+        fontcollection_ensure_seed_families(family->collection);
 
     if (!family->data->count)
     {
@@ -3047,6 +3061,12 @@ static HRESULT WINAPI dwritefontfamily_GetMatchingFonts(IDWriteFontFamily2 *ifac
 
     TRACE("%p, %d, %d, %d, %p.\n", iface, weight, stretch, style, ret);
 
+    /* Same rehydrate-on-demand pivot as the first-matching-font route: a system view slot
+       that is still empty pulls the catalogued seed fresh before the matched set is
+       built. */
+    if (!family->data->count && family->collection->is_system)
+        fontcollection_ensure_seed_families(family->collection);
+
     *ret = NULL;
 
     if (!(fonts = malloc(sizeof(*fonts))))
@@ -3088,13 +3108,25 @@ static HRESULT WINAPI dwritefontfamily_GetMatchingFonts(IDWriteFontFamily2 *ifac
     matchingfonts_sort(fonts, &req);
 
     /* Don't hand out a matched-fonts list without any font behind it: a caller that
-       resolves fonts from the list would end up with a NULL font carrier. */
+       resolves fonts from the list would end up with a NULL font carrier.  For a present
+       family the empty set becomes the one-close match - every face of the family is
+       accepted and re-sorted by the same distance criteria, closest first.  A family
+       whose slot is still empty after the seed re-pull has no font behind it at all and
+       keeps the no-font error. */
     if (!fonts->font_count)
     {
-        IDWriteFontFamily2_Release(&fonts->family->IDWriteFontFamily2_iface);
-        free(fonts->fonts);
-        free(fonts);
-        return DWRITE_E_NOFONT;
+        if (!family->data->count)
+        {
+            IDWriteFontFamily2_Release(&fonts->family->IDWriteFontFamily2_iface);
+            free(fonts->fonts);
+            free(fonts);
+            return DWRITE_E_NOFONT;
+        }
+
+        fonts->font_count = 0;
+        for (i = 0; i < family->data->count; ++i)
+            fonts->fonts[fonts->font_count++] = addref_font_data(family->data->fonts[i]);
+        matchingfonts_sort(fonts, &req);
     }
 
     *ret = (IDWriteFontList *)&fonts->IDWriteFontList2_iface;
@@ -3116,6 +3148,12 @@ static HRESULT WINAPI dwritefontfamily1_GetFont(IDWriteFontFamily2 *iface, UINT3
     TRACE("%p, %u, %p.\n", iface, index, font);
 
     *font = NULL;
+
+    /* Same rehydrate-on-demand pivot as the first-matching-font route above: a system
+       view slot that is still empty pulls the catalogued seed fresh before the pinned
+       default font is handed out, and never leaves a NULL font out-param behind. */
+    if (!family->data->count && family->collection->is_system)
+        fontcollection_ensure_seed_families(family->collection);
 
     /* Same as IDWriteFontFamily::GetFont(): an empty family hands the pinned default font
        out instead of leaving a NULL out-param behind. */
@@ -3352,14 +3390,13 @@ static ULONG WINAPI dwritefontcollection_Release(IDWriteFontCollection3 *iface)
     return refcount;
 }
 
-/* The fresh-factory entry-instant seed hydration on reads: any factory-instantiated
-   system collection read with a still-empty family table re-attempts the catalogued
-   seed fill synchronously under the collection section - enumeration callers never
-   walk a collapsed zero-family view, and a collection hydrated empty at build time
-   (a fresh factory whose streams could not open yet) heals on the first read after
-   the resident files become openable.  Seeding only appends to the family table,
-   the view never shrinks back to zero. */
-static void fontcollection_ensure_seed_families(struct dwrite_fontcollection *collection);
+/* The fresh-factory entry-instant seed hydration on reads (declared above the matching
+   routes it also backs): any factory-instantiated system collection read with a
+   still-empty family table re-attempts the catalogued seed fill synchronously under the
+   collection section - enumeration callers never walk a collapsed zero-family view, and
+   a collection hydrated empty at build time (a fresh factory whose streams could not
+   open yet) heals on the first read after the resident files become openable.  Seeding
+   only appends to the family table, the view never shrinks back to zero. */
 
 /* The family-count view callers enumerate through: a collection's family list is an
    immutable snapshot materialized at build time (from the factory's system set, which
