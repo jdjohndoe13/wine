@@ -2875,8 +2875,11 @@ static HRESULT WINAPI dwritefontfamily_GetFont(IDWriteFontFamily2 *iface, UINT32
 
     *font = NULL;
 
+    /* An empty family has no font a caller could resolve a face from.  Return a failure
+       instead of a success status paired with a NULL font, so callers skip this family
+       or its font instead of passing a NULL carrier forward. */
     if (!family->data->count)
-        return S_FALSE;
+        return DWRITE_E_NOFONT;
 
     if (index >= family->data->count)
         return E_INVALIDARG;
@@ -3046,6 +3049,16 @@ static HRESULT WINAPI dwritefontfamily_GetMatchingFonts(IDWriteFontFamily2 *ifac
     init_font_prop_vec(weight, stretch, style, &req);
     matchingfonts_sort(fonts, &req);
 
+    /* Don't hand out a matched-fonts list without any font behind it: a caller that
+       resolves fonts from the list would end up with a NULL font carrier. */
+    if (!fonts->font_count)
+    {
+        IDWriteFontFamily2_Release(&fonts->family->IDWriteFontFamily2_iface);
+        free(fonts->fonts);
+        free(fonts);
+        return DWRITE_E_NOFONT;
+    }
+
     *ret = (IDWriteFontList *)&fonts->IDWriteFontList2_iface;
     return S_OK;
 }
@@ -3065,8 +3078,10 @@ static HRESULT WINAPI dwritefontfamily1_GetFont(IDWriteFontFamily2 *iface, UINT3
 
     *font = NULL;
 
+    /* Same as IDWriteFontFamily::GetFont(): empty families fail the handout instead of
+       a success status with a NULL font. */
     if (!family->data->count)
-        return S_FALSE;
+        return DWRITE_E_NOFONT;
 
     if (index >= family->data->count)
         return E_FAIL;
@@ -4598,15 +4613,25 @@ static BOOL fontcollection_add_replacement(struct dwrite_fontcollection *collect
         struct dwrite_fontfamily_data *replacement = collection->family_data[i];
         WCHAR nameW[255];
 
-        for (i = 0; i < replacement->count; ++i)
+        /* Only add the target family when it actually receives faces; an empty family
+           must not surface in the enumeration set. */
+        if (replacement->count)
         {
-            fontfamily_add_font(target, replacement->fonts[i]);
-            addref_font_data(replacement->fonts[i]);
-        }
+            for (i = 0; i < replacement->count; ++i)
+            {
+                fontfamily_add_font(target, replacement->fonts[i]);
+                addref_font_data(replacement->fonts[i]);
+            }
 
-        fontcollection_add_family(collection, target);
-        fontstrings_get_en_string(replacement->familyname, nameW, ARRAY_SIZE(nameW));
-        TRACE("replacement %s -> %s\n", debugstr_w(target_name), debugstr_w(nameW));
+            fontcollection_add_family(collection, target);
+            fontstrings_get_en_string(replacement->familyname, nameW, ARRAY_SIZE(nameW));
+            TRACE("replacement %s -> %s\n", debugstr_w(target_name), debugstr_w(nameW));
+        }
+        else
+        {
+            release_fontfamily_data(target);
+            TRACE("not adding empty replacement %s\n", debugstr_w(target_name));
+        }
     }
     IDWriteLocalizedStrings_Release(strings);
     return TRUE;
@@ -4961,6 +4986,16 @@ static HRESULT eudc_collection_add_family(IDWriteFactory7 *factory, struct dwrit
     }
 
     /* add family to collection */
+    /* A family that ended up without any loadable face must never enter the collection:
+       its slot would keep surfacing an enumeration entry whose fonts resolve to nothing. */
+    if (!family_data->count)
+    {
+        release_fontfamily_data(family_data);
+        IDWriteFontFileStream_Release(stream);
+        IDWriteFontFile_Release(file);
+        return S_FALSE;
+    }
+
     hr = fontcollection_add_family(collection, family_data);
     if (FAILED(hr))
         release_fontfamily_data(family_data);
