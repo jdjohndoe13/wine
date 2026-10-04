@@ -402,6 +402,14 @@ extern HRESULT fontset_builder_get_entries(IDWriteFontSetBuilder2 *iface, struct
 extern HRESULT fontset_create_from_set(IDWriteFactory7 *factory, struct dwrite_fontset_entry **src_entries,
         unsigned int count, BOOL is_system, IDWriteFontSet **ret);
 
+/* Fresh-factory entry-instant hydration: materializes the catalogued seed content
+   (faces of the first loadable resident system font file) away from the factory
+   table. create_system_fontset installs it when a fresh factory's build/rebuild
+   attempt has left its standing table empty, so the first GetSystemFontCollection
+   entry instant serves a hydrated set view instead of an empty one. */
+extern HRESULT system_fontset_seed_entries(IDWriteFactory7 *factory, struct dwrite_fontset_entry ***ret,
+        unsigned int *ret_count);
+
 struct dwrite_fontface;
 
 extern float fontface_get_scaled_design_advance(struct dwrite_fontface *fontface, DWRITE_MEASURING_MODE measuring_mode,

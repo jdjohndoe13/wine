@@ -1857,6 +1857,8 @@ static HRESULT factory_create_system_fontset(struct dwritefactory *factory, cons
 HRESULT create_system_fontset(IDWriteFactory7 *factory_iface, REFIID riid, void **obj)
 {
     struct dwritefactory *factory = impl_from_IDWriteFactory7(factory_iface);
+    struct dwrite_fontset_entry **seed_entries = NULL;
+    unsigned int seed_count = 0, i;
     IDWriteFontSet *fontset;
     FILETIME timestamp;
     HRESULT hr;
@@ -1876,6 +1878,36 @@ HRESULT create_system_fontset(IDWriteFactory7 *factory_iface, REFIID riid, void 
         hr = factory_create_system_fontset(factory, &timestamp);
     else
         hr = S_OK;
+
+    /* The fresh-factory entry-instant hydration: when the attempt above still leaves
+       the standing table empty (a fresh factory whose first fetch hit a not-yet-built
+       state - an empty rebuild rejected away, or a builder that failed outright), the
+       catalogued seed content is installed synchronously so the view served from this
+       fetch - the collection build included - starts from a hydrated system set, never
+       an empty one. Installed seed content carries the fetch timestamp and is replaced
+       when the next real rebuild succeeds; a failed hydration is dropped and retried
+       on the next fetch like a rejected empty scan. */
+    if (!factory->system_set.entries || !factory->system_set.count)
+    {
+        seed_entries = NULL;
+        seed_count = 0;
+
+        if (SUCCEEDED(system_fontset_seed_entries(factory_iface, &seed_entries, &seed_count)) && seed_count)
+        {
+            factory_cleanup_fontset(factory);
+            factory->system_set.entries = seed_entries;
+            factory->system_set.count = seed_count;
+            factory->system_set.timestamp = timestamp;
+            hr = S_OK;
+            TRACE("Hydrated the fresh factory system table from the catalogued seed, %u entries.\n", seed_count);
+        }
+        else
+        {
+            for (i = 0; i < seed_count; ++i)
+                release_fontset_entry(seed_entries[i]);
+            free(seed_entries);
+        }
+    }
 
     if (SUCCEEDED(hr) || (factory->system_set.entries && factory->system_set.count))
     {
