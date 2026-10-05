@@ -3308,6 +3308,10 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         return;
     }
 
+    /* Hack (CW-Bug-Id #26914 parity, Valve 09ab0e2ebcee): withdraw before XReconfigureWMWindow() to avoid a Mutter Wayland _XWAYLAND_ALLOW_COMMITS freeze. */
+    if (get_desired_wm_state( new_style, new_rects ) == WithdrawnState)
+        window_set_wm_state( data, WithdrawnState, FALSE );
+
     /* don't change position if we are about to minimize or maximize a managed window */
     if (!(data->managed && (swp_flags & SWP_STATECHANGED) && (new_style & (WS_MINIMIZE|WS_MAXIMIZE))))
     {
