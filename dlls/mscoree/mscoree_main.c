@@ -760,9 +760,10 @@ static int compare_versions(const char *a, const char *b)
 
 static BOOL mono_installer_disabled(void)
 {
-    /* opt-in kill switch for the Wine Mono installer modal (per-prefix):
+    /* legacy hard kill switch for the Wine Mono installer route (per-prefix):
        HKCU\Software\Wine\Mono, value InstallerDisabled (REG_DWORD, nonzero).
-       Without the key the upstream behavior (install dialog) is unchanged. */
+       When set it stays a hard kill switch: the silent skip always wins and
+       the ShowInstallerDialog opt-out below is ignored. */
     static const WCHAR mono_key[] = {'S','o','f','t','w','a','r','e','\\','W','i','n','e','\\','M','o','n','o',0};
     static const WCHAR installer_disabled[] = {'I','n','s','t','a','l','l','e','r','D','i','s','a','b','l','e','d',0};
 
@@ -773,6 +774,37 @@ static BOOL mono_installer_disabled(void)
         return FALSE;
 
     if (RegQueryValueExW(key, installer_disabled, 0, &type, (LPBYTE)&value, &size) != ERROR_SUCCESS ||
+        type != REG_DWORD || !value)
+    {
+        RegCloseKey(key);
+        return FALSE;
+    }
+    RegCloseKey(key);
+    return TRUE;
+}
+
+/* Wine Mono installer policy: when no usable Wine Mono runtime is present, we
+   skip the interactive installer dialog by default and fail silently instead.
+   Operators restore the upstream control.exe appwiz.cpl dialog per prefix with
+   HKCU\Software\Wine\Mono, value ShowInstallerDialog (REG_DWORD, nonzero);
+   absent, zero or wrong-type keeps the default silent skip. The legacy
+   InstallerDisabled value (above) remains a hard kill switch: when set the
+   dialog is never shown, overriding ShowInstallerDialog. */
+static BOOL mono_show_installer_dialog(void)
+{
+    static const WCHAR mono_key[] = {'S','o','f','t','w','a','r','e','\\','W','i','n','e','\\','M','o','n','o',0};
+    static const WCHAR show_installer_dialog[] = {'S','h','o','w','I','n','s','t','a','l','l','e','r','D','i','a','l','o','g',0};
+
+    DWORD type, value = 0, size = sizeof(value);
+    HKEY key;
+
+    if (mono_installer_disabled())
+        return FALSE;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, mono_key, 0, KEY_READ, &key))
+        return FALSE;
+
+    if (RegQueryValueExW(key, show_installer_dialog, 0, &type, (LPBYTE)&value, &size) != ERROR_SUCCESS ||
         type != REG_DWORD || !value)
     {
         RegCloseKey(key);
@@ -899,9 +931,9 @@ static BOOL install_wine_mono(void)
     {
         TRACE("mono runtime not found\n");
 
-        if (mono_installer_disabled())
+        if (!mono_show_installer_dialog())
         {
-            FIXME("SilentNoDotNetDisabled: skipping Wine Mono installer dialog\n");
+            TRACE("SilentNoDotNetDisabled: skipping Wine Mono installer dialog (default; set ShowInstallerDialog to restore)\n");
             return FALSE;
         }
 
@@ -972,6 +1004,13 @@ static BOOL install_wine_mono(void)
         }
         else
             ERR("MsiInstallProduct failed, err=%i\n", res);
+    }
+
+    if (!mono_show_installer_dialog())
+    {
+        TRACE("SilentNoDotNetDisabled: skipping Wine Mono installer dialog (default; set ShowInstallerDialog to restore)\n");
+        ret = FALSE;
+        goto end;
     }
 
     ret = invoke_appwiz();
