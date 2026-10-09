@@ -2636,6 +2636,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
         accept_hardware_message( hw_id );
         return FALSE;
     }
+    TRACE( "HTOv0 retarget raw=%p child=%p hit=%d msg=%#x pt=(%d,%d)\n", msg->hwnd, msg->hwnd, hittest, msg->message, msg->pt.x, msg->pt.y );
     update_current_mouse_window( msg->hwnd, hittest, msg->pt );
 
     msg->pt = point_phys_to_win_dpi( msg->hwnd, msg->pt );
