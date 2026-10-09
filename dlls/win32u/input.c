@@ -1848,6 +1848,7 @@ void update_mouse_tracking_info( HWND hwnd )
     TRACE( "hwnd %p\n", hwnd );
 
     hwnd = get_mouse_window( hwnd, &hittest, &pos, tracking );
+    TRACE( "HTOva gmw hwnd=%p hittest=%d pos=%s\n", hwnd, hittest, wine_dbgstr_point(&pos) );
 
     NtUserSystemParametersInfo( SPI_GETMOUSEHOVERWIDTH, 0, &hover_width, 0 );
     NtUserSystemParametersInfo( SPI_GETMOUSEHOVERHEIGHT, 0, &hover_height, 0 );
@@ -1859,11 +1860,13 @@ void update_mouse_tracking_info( HWND hwnd )
     if (tracking->info.dwFlags & TME_LEAVE)
         check_mouse_leave( hwnd, hittest, tracking );
 
+    TRACE( "HTOvb state hwndTrack=%p mousewin=%p dwFlags=%#x lasth=%p lasthit=%d\n", tracking->info.hwndTrack, hwnd, tracking->info.dwFlags, tracking->last_mouse_message_hwnd, tracking->last_mouse_message_hittest );
     if (tracking->info.hwndTrack != hwnd)
         tracking->info.dwFlags &= ~TME_HOVER;
 
     if (tracking->info.dwFlags & TME_HOVER)
     {
+        TRACE( "HTOvc diff dx=%d dy=%d hw=%d hh=%d hit=%d\n", abs(pos.x - tracking->pos.x), abs(pos.y - tracking->pos.y), hover_width, hover_height, hittest );
         /* has the cursor moved outside the rectangle centered around pos? */
         if ((abs( pos.x - tracking->pos.x ) > (hover_width / 2)) ||
             (abs( pos.y - tracking->pos.y ) > (hover_height / 2)))
