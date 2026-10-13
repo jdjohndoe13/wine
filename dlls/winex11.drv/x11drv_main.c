@@ -74,6 +74,7 @@ BOOL use_system_cursors = TRUE;
 BOOL grab_fullscreen = FALSE;
 BOOL managed_mode = TRUE;
 BOOL private_color_map = FALSE;
+BOOL canvas_guard = FALSE;
 int primary_monitor = 0;
 BOOL client_side_graphics = TRUE;
 BOOL client_side_with_render = TRUE;
@@ -491,6 +492,9 @@ static void setup_options(void)
 
     if (!get_config_key( hkey, appkey, "PrivateColorMap", buffer, sizeof(buffer) ))
         private_color_map = IS_OPTION_TRUE( buffer[0] );
+
+    if (!get_config_key( hkey, appkey, "CanvasGuardEnabled", buffer, sizeof(buffer) ))
+        canvas_guard = IS_OPTION_TRUE( buffer[0] );
 
     if (!get_config_key( hkey, appkey, "PrimaryMonitor", buffer, sizeof(buffer) ))
         primary_monitor = wcstol( buffer, NULL, 0 );
