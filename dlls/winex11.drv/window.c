@@ -3155,6 +3155,8 @@ void X11DRV_SetCapture( HWND hwnd, UINT flags, HWND previous )
 void X11DRV_SetParent( HWND hwnd, HWND parent, HWND old_parent )
 {
     struct x11drv_win_data *data;
+    Window parent_window;
+    DWORD ex_style;
 
     if (parent == old_parent) return;
     if (!(data = get_win_data( hwnd ))) return;
@@ -3164,8 +3166,29 @@ void X11DRV_SetParent( HWND hwnd, HWND parent, HWND old_parent )
     {
         if (old_parent == NtUserGetDesktopWindow())
         {
-            /* destroy the old X windows */
-            destroy_whole_window( data, FALSE );
+            /*
+             * canvas Surgery Guard (CanvasGuardEnabled): the canvas window that just
+             * flipped to WS_EX_NOREDIRECTIONBITMAP right before being SetParent'ed
+             * from the desktop into a child slot must keep its whole X window.
+             * Stock wine destroys it here, and desktop-to-child transitions have no
+             * X window re-create path, so the canvas plane would stay surface-less
+             * for the window's life. Re-host the window under the new parent's X
+             * window (XEmbed embedder attach bookkeeping). All other windows keep
+             * the stock destroy path.
+             */
+            ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
+            if (canvas_guard && !data->embedded &&
+                (ex_style & WS_EX_NOREDIRECTIONBITMAP || data->client_window))
+            {
+                TRACE( "canvas-guard keep-window XID %lx in SetParent desktop->child\n", (unsigned long)data->whole_window );
+                parent_window = X11DRV_get_whole_window( parent );
+                if (parent_window) set_window_parent( data, parent_window );
+            }
+            else
+            {
+                /* destroy the old X windows */
+                destroy_whole_window( data, FALSE );
+            }
         }
     }
     else  /* new top level window */
