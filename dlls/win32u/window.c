@@ -332,6 +332,36 @@ void detach_client_surfaces( HWND hwnd )
     pthread_mutex_unlock( &surfaces_lock );
 }
 
+/* Track-3: a pane flip hides or re-creates the child pane that hosted a client surface while the
+ * surface itself survives (parked in unused_surfaces, or still attached); when it is recycled or
+ * re-presented afterwards, its content still predates the flip (a frozen webview checkpoint) and
+ * gets replayed until the next real rebuild. Purge at the pane-change seams: drop the parked
+ * surfaces so their driver windows are destroyed with the stale checkpoint, and mark the attached
+ * ones so the driver refreshes them instead of replaying stale content on the next present. */
+static void purge_client_surfaces( HWND hwnd )
+{
+    struct client_surface *surface, *next;
+    HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
+
+    pthread_mutex_lock( &surfaces_lock );
+
+    LIST_FOR_EACH_ENTRY_SAFE( surface, next, &client_surfaces, struct client_surface, entry )
+    {
+        if (!surface->hwnd || NtUserGetAncestor( surface->hwnd, GA_ROOT ) != toplevel) continue;
+        WARN( "purging stale content of client surface %s after pane change\n", debugstr_client_surface( surface ) );
+        surface->updated = TRUE;
+    }
+
+    LIST_FOR_EACH_ENTRY_SAFE( surface, next, &unused_surfaces, struct client_surface, entry )
+    {
+        if (!surface->hwnd || NtUserGetAncestor( surface->hwnd, GA_ROOT ) != toplevel) continue;
+        WARN( "dropping recycled client surface %s with stale content\n", debugstr_client_surface( surface ) );
+        client_surface_release_locked( surface );
+    }
+
+    pthread_mutex_unlock( &surfaces_lock );
+}
+
 /* server-fresh copy of the get_window_rects() request body, for callers that suspect the cached
  * client-side rects went stale; pure query, no locking beyond the server request itself */
 static BOOL get_window_rects_authoritative( HWND hwnd, enum coords_relative relative,
@@ -4274,6 +4304,10 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
         if (NtUserGetAncestor( winpos->hwnd, GA_PARENT ) == get_desktop_window())
             winpos->hwndInsertAfter = swp_owner_popups( winpos->hwnd, winpos->hwndInsertAfter );
     }
+
+    /* Track-3: show/hide flips re-present recycled client surfaces with stale content; purge the
+     * stale checkpoint surfaces at every real visibility change of the window tree. */
+    if (winpos->flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)) purge_client_surfaces( winpos->hwnd );
 
     /* Common operations */
 
