@@ -1421,6 +1421,20 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
     if (data->state_locks) return; /* win32 state is being updated, delay the change */
     if (!data->whole_window) return; /* no window, nothing to update */
     if (EqualRect( old_rect, new_rect ) && (old_above || !above || data->managed)) return; /* rects are the same, no need to be raised, nothing to update */
+    if (EqualRect( new_rect, &data->config_refused ))
+    {
+        /* Track-3 v3: the WM already refused this exact config; re-requesting re-fires
+         * the geometry war. Converge the X-side state to the delivered config instead. */
+        WARN( "Track-3 v3: window %p/%lx suppressing re-request of refused config %s (round %u)\n",
+              data->hwnd, data->whole_window, wine_dbgstr_rect( new_rect ),
+              data->config_refuse_count );
+        data->config_refuse_count++;
+        data->desired_state.rect = data->current_state.rect;
+        data->pending_state.rect = data->current_state.rect;
+        SetRectEmpty( &data->config_refused ); /* next genuinely different request is allowed */
+        data->pending_state.above = FALSE;
+        return;
+    }
     if (window_needs_config_change_delay( data ))
     {
         TRACE( "window %p/%lx is updating _NET_WM_STATE/_MOTIF_WM_HINTS, delaying request\n", data->hwnd, data->whole_window );
@@ -1778,6 +1792,17 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
 
     if ((flags & (SWP_NOSIZE | SWP_NOMOVE)) == (SWP_NOSIZE | SWP_NOMOVE)) return 0;
 
+    if (data->wm_refused)
+    {
+        /* Track-3 v3: the WM just refused our config; adopt the delivered rect without
+         * giving the app a WM_WINDOWPOSCHANGING veto */
+        flags |= SWP_NOSENDCHANGING;
+        WARN( "Track-3 v3: window %p/%lx forcing win32 adoption of delivered rect %s "
+              "(SWP_NOSENDCHANGING)\n", data->hwnd, data->whole_window,
+              wine_dbgstr_rect(&new_rect) );
+        data->wm_refused = FALSE;
+    }
+
     /* avoid event feedback loops from window rect adjustments of maximized / fullscreen windows */
     if (data->current_state.net_wm_state & fullscreen_mask) flags |= SWP_NOSENDCHANGING;
 
@@ -1832,6 +1857,8 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
         if (!data->state_locks++) TRACE( "Locked window %p/%lx state\n", data->hwnd, data->whole_window );
         *state_cmd = window_update_client_state( data );
         *swp_flags = window_update_client_config( data );
+        /* Track-3 v3: latch consumed by this query */
+        data->wm_refused = FALSE;
         *rect = window_rect_from_visible( &data->rects, data->current_state.rect );
         release_win_data( data );
     }
@@ -1963,6 +1990,8 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
 {
     RECT *desired = &data->desired_state.rect, *pending = &data->pending_state.rect, *current = &data->current_state.rect;
     unsigned long *expect_serial = &data->configure_serial;
+    RECT requested;          /* Track-3 v3: snapshot of the config we asked for */
+    unsigned long expecting; /* Track-3 v3: snapshot of the expected serial */
     const char *expected, *received, *prefix;
 
     prefix = wine_dbg_sprintf( "window %p/%lx ", data->hwnd, data->whole_window );
@@ -1977,9 +2006,23 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
         desired = pending;
     }
 
+    /* Track-3 v3: snapshot the pending request before handle_state_change consumes it */
+    requested = data->pending_state.rect;
+    expecting = *expect_serial;
+
     if (!handle_state_change( serial, expect_serial, sizeof(*value), value, desired, pending,
                               current, expected, prefix, received, NULL ))
         return;
+    /* Track-3 v3: the WM refused the config that was expected */
+    if (expecting && !EqualRect( &requested, value ))
+    {
+        WARN( "Track-3 v3: window %p/%lx WM refused requested config %s, delivered %s/%lu\n",
+              data->hwnd, data->whole_window, wine_dbgstr_rect(&requested),
+              wine_dbgstr_rect(value), serial );
+        data->config_refused = requested;
+        data->config_refuse_count++;
+        data->wm_refused = TRUE;
+    }
     data->pending_state.above = FALSE; /* allow requesting it again */
 
     /* send any pending changes from the desired state */
