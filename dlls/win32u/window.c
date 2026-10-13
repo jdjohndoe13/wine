@@ -335,31 +335,29 @@ void detach_client_surfaces( HWND hwnd )
 /* Track-3: a pane flip hides or re-creates the child pane that hosted a client surface while the
  * surface itself survives (parked in unused_surfaces, or still attached); when it is recycled or
  * re-presented afterwards, its content still predates the flip (a frozen webview checkpoint) and
- * gets replayed until the next real rebuild. Purge at the pane-change seams: drop the parked
+ * gets replayed until the next real rebuild. Purge at the re-present seam: drop the retained
  * surfaces so their driver windows are destroyed with the stale checkpoint, and mark the attached
- * ones so the driver refreshes them instead of replaying stale content on the next present. */
-static void purge_client_surfaces( HWND hwnd )
+ * ones so the driver refreshes them instead of replaying stale content on the next present.
+ * Hooked at the client-surface attach point, use_window_client_surface(); the caller must hold
+ * surfaces_lock. */
+static void purge_client_surfaces_locked( HWND hwnd )
 {
     struct client_surface *surface, *next;
     HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
 
-    pthread_mutex_lock( &surfaces_lock );
-
     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &client_surfaces, struct client_surface, entry )
     {
         if (!surface->hwnd || NtUserGetAncestor( surface->hwnd, GA_ROOT ) != toplevel) continue;
-        WARN( "purging stale content of client surface %s after pane change\n", debugstr_client_surface( surface ) );
+        WARN( "Track-3 v2: marking client surface %s for refresh on next present\n", debugstr_client_surface( surface ) );
         surface->updated = TRUE;
     }
 
     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &unused_surfaces, struct client_surface, entry )
     {
         if (!surface->hwnd || NtUserGetAncestor( surface->hwnd, GA_ROOT ) != toplevel) continue;
-        WARN( "dropping recycled client surface %s with stale content\n", debugstr_client_surface( surface ) );
+        WARN( "Track-3 v2: dropping retained client surface %s with stale content\n", debugstr_client_surface( surface ) );
         client_surface_release_locked( surface );
     }
-
-    pthread_mutex_unlock( &surfaces_lock );
 }
 
 /* server-fresh copy of the get_window_rects() request body, for callers that suspect the cached
@@ -635,6 +633,11 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         WARN( "surface %s has been detached already, ignoring.\n", debugstr_client_surface( surface ) );
     else if (use)
     {
+        /* Track-3: re-attaching a client surface re-presents the content retained in the client
+         * window tree until the next real rebuild; purge the retained surfaces first, so the next
+         * present starts from a fresh layout instead of replaying a stale checkpoint. */
+        purge_client_surfaces_locked( surface->hwnd );
+
         /* surface wasn't used, it shouldn't be in any list */
         list_add_tail( &client_surfaces, &surface->entry );
         client_surface_update_locked( surface );
@@ -4305,10 +4308,6 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
         if (NtUserGetAncestor( winpos->hwnd, GA_PARENT ) == get_desktop_window())
             winpos->hwndInsertAfter = swp_owner_popups( winpos->hwnd, winpos->hwndInsertAfter );
     }
-
-    /* Track-3: show/hide flips re-present recycled client surfaces with stale content; purge the
-     * stale checkpoint surfaces at every real visibility change of the window tree. */
-    if (winpos->flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)) purge_client_surfaces( winpos->hwnd );
 
     /* Common operations */
 
