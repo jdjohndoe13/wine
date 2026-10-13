@@ -3879,7 +3879,14 @@ static BOOL calc_winpos( WINDOWPOS *winpos, struct window_rects *old_rects, stru
     /* Send WM_WINDOWPOSCHANGING message */
     if (!(winpos->flags & SWP_NOSENDCHANGING)
            && !((winpos->flags & SWP_AGG_NOCLIENTCHANGE) && (winpos->flags & SWP_SHOWWINDOW)))
+    {
+        int proposed_cx = winpos->cx, proposed_cy = winpos->cy;  /* Track-3 v3: veto prover */
+
         send_message( winpos->hwnd, WM_WINDOWPOSCHANGING, 0, (LPARAM)winpos );
+        if (proposed_cx != winpos->cx || proposed_cy != winpos->cy)
+            WARN( "Track-3 v3: hwnd %p WM_WINDOWPOSCHANGING rewrote proposed rect -> %dx%d\n",
+                  winpos->hwnd, winpos->cx, winpos->cy );
+    }
 
     if (!(win = get_win_ptr( winpos->hwnd )) ||
         win == WND_OTHER_PROCESS || win == WND_DESKTOP) return FALSE;
