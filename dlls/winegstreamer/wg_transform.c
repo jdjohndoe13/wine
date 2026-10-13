@@ -39,6 +39,21 @@
 
 #include "unix_private.h"
 
+/* shim for gstreamer < 1.16 (Debian 10 ships 1.14): implement
+ * gst_video_format_info_component() locally, as upstream does. */
+#if !GST_CHECK_VERSION(1, 16, 0)
+static void
+gst_video_format_info_component(const GstVideoFormatInfo *finfo, gint plane,
+        gint components[GST_VIDEO_MAX_COMPONENTS])
+{
+    gint c, i = 0;
+
+    for (c = 0; c < finfo->n_components; c++)
+        if (plane == finfo->plane[c])
+            components[i++] = c;
+    components[i] = -1;
+}
+#endif
 #define GST_SAMPLE_FLAG_WG_CAPS_CHANGED (GST_MINI_OBJECT_FLAG_LAST << 0)
 
 /* This GstElement takes buffers and events from its sink pad, instead of pushing them
