@@ -374,6 +374,10 @@ struct x11drv_client_surface
 
     HDC hdc_src;
     HDC hdc_dst;
+
+    /* WS: gx11 instrument stamps (instrument-only, no behavior change); zeroed with the surface */
+    DWORD last_map_state;
+    DWORD last_geo;
 };
 
 extern struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client );

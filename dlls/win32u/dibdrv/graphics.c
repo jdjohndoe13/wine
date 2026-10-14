@@ -1210,6 +1210,22 @@ BOOL dibdrv_PatBlt( PHYSDEV dev, struct bitblt_coords *dst, DWORD rop )
               pb_clip_box, (unsigned int)clipped_rects.count );
     }
 
+    /* WS: pblt2 row: WARN-only instrument, no behavior change. Finer census: same rop gate as the
+     * WS: pblt row but any size >= 8x8 (the >=300x200 gate above stays on the WS: pblt row alone),
+     * throttled to one row per second. */
+    if ((rop == PATCOPY || rop == WHITENESS) &&
+        dst->visrect.right - dst->visrect.left >= 8 && dst->visrect.bottom - dst->visrect.top >= 8)
+    {
+        static DWORD ws_last_pblt2;
+        DWORD ws_now = NtGetTickCount();
+        if (ws_now - ws_last_pblt2 > 1000)
+        {
+            ws_last_pblt2 = ws_now;
+            WARN( "WS: pblt2 hdc %p rop %08x rect %s\n",
+                  dc->hSelf, rop, wine_dbgstr_rect( &dst->visrect ) );
+        }
+    }
+
     switch (rop2)  /* shortcuts for rops that don't involve the brush */
     {
     case R2_NOT:   and = ~0u;
