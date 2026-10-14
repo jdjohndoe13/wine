@@ -892,6 +892,11 @@ static void update_visible_region( struct dce *dce )
     RECT win_rect, top_rect;
     WND *win;
 
+    /* WS: vis instrument-only locals (no behavior change) */
+    UINT server_n = 0;
+    RECT vis_box;
+    INT vis_type;
+
     /* don't clip siblings if using parent clip region */
     if (flags & DCX_PARENTCLIP) flags &= ~DCX_CLIPSIBLINGS;
 
@@ -913,6 +918,7 @@ static void update_visible_region( struct dce *dce )
                 data->rdh.iType    = RDH_RECTANGLES;
                 data->rdh.nCount   = reply_size / sizeof(RECT);
                 data->rdh.nRgnSize = reply_size;
+                server_n = data->rdh.nCount;   /* WS: vis instrument-only capture */
                 vis_rgn = NtGdiExtCreateRegion( NULL, data->rdh.dwSize + data->rdh.nRgnSize, data );
                 top_win     = wine_server_ptr_handle( reply->top_win );
                 win_rect    = wine_server_get_rect( reply->win_rect );
@@ -945,6 +951,17 @@ static void update_visible_region( struct dce *dce )
     }
 
     if (!surface) SetRectEmpty( &top_rect );
+
+    /* WS: vis row: WARN-only instrument, no behavior change */
+    vis_type = NtGdiGetRgnBox( vis_rgn, &vis_box );
+    if ((dce->flags & DCX_CLIPCHILDREN) && vis_type != ERROR &&
+        vis_box.right - vis_box.left >= 300 && vis_box.bottom - vis_box.top >= 200)
+    {
+        WARN( "WS: vis hwnd %p dce_flags %08x server_n %u rgn %s box %s win_rect %s top_win %p surface %p\n",
+              dce->hwnd, dce->flags, server_n, wine_dbg_sprintf( "type %d", vis_type ),
+              wine_dbgstr_rect( &vis_box ), wine_dbgstr_rect( &win_rect ), top_win, surface );
+    }
+
     set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface );
     if (surface) window_surface_release( surface );
 }
@@ -1780,9 +1797,76 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
     RECT rect;
     UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_NOCHILDREN;
 
+    /* WS: bp instrument-only locals (no behavior change) */
+    DWORD bp_style;
+    INT bp_type;
+    UINT bp_nvis, bp_ninbox, bp_nsib;
+    int bp_i;
+    LONG bp_area, bp_best;
+    HWND bp_parent, bp_max_child, *bp_list;
+    RECT bp_box, bp_max, bp_child, bp_dummy;
+    struct window_rects bp_rects;
+
     NtUserHideCaret( hwnd );
 
     if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) return 0;
+
+    /* WS: bp row: WARN-only instrument, no behavior change. hrgn from send_ncpaint is in screen coords. */
+    bp_style = get_window_long( hwnd, GWL_STYLE );
+    bp_type = NtGdiGetRgnBox( hrgn, &bp_box );
+    if ((bp_style & WS_CLIPCHILDREN) &&
+        (bp_type == SIMPLEREGION || bp_type == COMPLEXREGION) &&
+        !IsRectEmpty( &bp_box ) &&
+        bp_box.right - bp_box.left >= 300 &&
+        bp_box.bottom - bp_box.top >= 200)
+    {
+        bp_nvis = bp_ninbox = bp_nsib = 0;
+        bp_best = 0;
+        bp_max_child = 0;
+        SetRectEmpty( &bp_max );
+
+        bp_list = list_window_children( hwnd );
+        if (bp_list)
+        {
+            for (bp_i = 0; bp_list[bp_i]; bp_i++)
+            {
+                if (!(get_window_long( bp_list[bp_i], GWL_STYLE ) & WS_VISIBLE)) continue;
+                get_window_rects( bp_list[bp_i], COORDS_SCREEN, &bp_rects, get_thread_dpi() );
+                bp_child = bp_rects.window;
+                if (!intersect_rect( &bp_dummy, &bp_child, &bp_box )) continue;
+                bp_nvis++;
+                bp_area = (LONG)(bp_child.right - bp_child.left) * (LONG)(bp_child.bottom - bp_child.top);
+                if (bp_area > bp_best)
+                {
+                    bp_best = bp_area;
+                    bp_max_child = bp_list[bp_i];
+                    bp_max = bp_child;
+                }
+                if (EqualRect( &bp_dummy, &bp_child )) bp_ninbox++;
+            }
+            free( bp_list );
+        }
+
+        bp_parent = NtUserGetAncestor( hwnd, GA_PARENT );
+        bp_list = bp_parent ? list_window_children( bp_parent ) : NULL;
+        if (bp_list)
+        {
+            for (bp_i = 0; bp_list[bp_i]; bp_i++)
+            {
+                if (bp_list[bp_i] == hwnd) continue;
+                if (!(get_window_long( bp_list[bp_i], GWL_STYLE ) & WS_VISIBLE)) continue;
+                get_window_rects( bp_list[bp_i], COORDS_SCREEN, &bp_rects, get_thread_dpi() );
+                bp_child = bp_rects.window;
+                if (!intersect_rect( &bp_dummy, &bp_child, &bp_box )) continue;
+                bp_nsib++;
+            }
+            free( bp_list );
+        }
+
+        WARN( "WS: bp hwnd %p style %08x rgn %s box %s flags %08x n_vis %u n_inbox %u max_child hwnd %p rect %s n_sib %u\n",
+              hwnd, bp_style, wine_dbg_sprintf( "type %d", bp_type ), wine_dbgstr_rect( &bp_box ),
+              flags, bp_nvis, bp_ninbox, bp_max_child, wine_dbgstr_rect( &bp_max ), bp_nsib );
+    }
 
     erase = send_erase( hwnd, flags, hrgn, &rect, &hdc );
 
