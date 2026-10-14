@@ -655,22 +655,58 @@ void window_surface_flush( struct window_surface *surface )
 
         if (ws_probe_big( surface ) && color_info->bmiHeader.biBitCount == 32)
         {
-            LONG width = color_info->bmiHeader.biWidth, rows = color_info->bmiHeader.biHeight;
-            LONG stride;
-            UINT white = 0, i, px, py;
-            const BYTE *bits = (const BYTE *)color_bits;
+            UINT bpr    = ((UINT)color_info->bmiHeader.biWidth * 4 + 3) & ~3;
+            UINT height = (UINT)abs( color_info->bmiHeader.biHeight );
+            UINT w      = dirty.right > dirty.left ? dirty.right - dirty.left : 1;
+            UINT ys[3]  = { (UINT)max( 0, dirty.top ), ((UINT)dirty.top + (UINT)dirty.bottom) / 2,
+                            (UINT)max( 0, dirty.bottom - 1 ) };
+            UINT white[3] = {0}, white_m[3] = {0}, probes[3] = {0}, k, i;
+            DWORD vals[2];
+            const DWORD *row;
+            UINT y;
 
-            if (rows < 0) rows = -rows;
-            stride = rows ? (LONG)(color_info->bmiHeader.biSizeImage / rows) : 0;
-            if (width > 0 && rows > 0 && stride > 0)
-                for (i = 0; i < 64; i++)
+            for (k = 0; k < 3; k++)
+            {
+                y = ys[k] < height ? ys[k] : (height ? height - 1 : 0);
+                row = (const DWORD *)((const BYTE *)color_bits + (size_t)y * bpr);
+                for (i = 0; i < 12; i++)
                 {
-                    px = (i & 7) * (width - 1) / 8;
-                    py = (i >> 3) * (rows - 1) / 8;
-                    if ((*(const DWORD *)(bits + (DWORD_PTR)py * stride + (DWORD_PTR)px * 4) & 0x00ffffff) == 0x00ffffff) white++;
+                    UINT x = dirty.left + (UINT)((LONGLONG)w * i / 12);
+                    if (x < (UINT)color_info->bmiHeader.biWidth)
+                    {
+                        DWORD px = row[x];
+                        if ((px & 0x00ffffff) == 0x00ffffff) white[k]++;
+                        probes[k]++;
+                    }
                 }
-            WARN( "WS: flush hwnd %p bitmap %p bounds %s dirty %s white %u/%u\n", surface->hwnd, surface->color_bitmap,
-                  wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ), white, (UINT)64 );
+            }
+            /* mirrored rows: if the DIB is bottom-up (biHeight > 0 in wine's DIBSection),
+               the v1 samples read one fixed row; this variant samples height-1-y too */
+            for (k = 0; k < 3; k++)
+            {
+                UINT ym = height ? height - 1 - ys[k] : 0;
+                if (ym >= height) ym = 0;
+                row = (const DWORD *)((const BYTE *)color_bits + (size_t)ym * bpr);
+                for (i = 0; i < 12; i++)
+                {
+                    UINT x = dirty.left + (UINT)((LONGLONG)w * i / 12);
+                    if (x < (UINT)color_info->bmiHeader.biWidth)
+                    {
+                        DWORD px = row[x];
+                        if ((px & 0x00ffffff) == 0x00ffffff) white_m[k]++;
+                    }
+                }
+            }
+            {
+                UINT ymid = ((UINT)dirty.top + (UINT)dirty.bottom) / 2;
+                const DWORD *rmid = (const DWORD *)((const BYTE *)color_bits + (size_t)ymid * bpr);
+                vals[0] = rmid[ dirty.left % (UINT)color_info->bmiHeader.biWidth ];
+                vals[1] = rmid[ (dirty.left + w/2) % (UINT)color_info->bmiHeader.biWidth ];
+            }
+            WARN( "WS: flush2 hwnd %p bitmap %p dirty %s top %u/12 mid %u/12 bot %u/12 mirror %u %u %u vals %08x %08x\n",
+                  surface->hwnd, surface->color_bitmap, wine_dbgstr_rect( &dirty ),
+                  white[0], probes[0], white[1], probes[1], white[2], probes[2],
+                  white_m[0], white_m[1], white_m[2], vals[0], vals[1] );
         }
     }
 
