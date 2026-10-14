@@ -973,6 +973,15 @@ static void update_visible_region( struct dce *dce )
               wine_dbgstr_rect( &vis_box ), wine_dbgstr_rect( &win_rect ), top_win, surface );
     }
 
+    /* WS: visall row: WARN-only instrument, no behavior change. Same big-rect gate as the
+     * 'WS: vis' row but unconditional (no DCX_CLIPCHILDREN gate). */
+    if (vis_type != ERROR &&
+        vis_box.right - vis_box.left >= 300 && vis_box.bottom - vis_box.top >= 200)
+    {
+        WARN( "WS: visall hwnd %p dce_flags %08x box %s\n",
+              dce->hwnd, dce->flags, wine_dbgstr_rect( &vis_box ) );
+    }
+
     /* W6 white-out fix: CLIPCHILDREN parent DC refreshes must exclude attached client-surface
      * child rects (Windows semantics). Insert point: after the 'WS: vis' instrument row, before
      * set_visible_region — vis_rgn is still in SCREEN coords here (the server maps the reply
