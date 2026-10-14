@@ -283,6 +283,8 @@ static void x11drv_client_surface_detach( struct client_surface *client )
     if ((data = get_win_data( hwnd )))
     {
         detach_client_window( data, client_window );
+        /* WS: gdetach row: WARN-only instrument, no behavior change */
+        WARN( "WS: gdetach hwnd %p window %lx\n", hwnd, client_window );
         release_win_data( data );
     }
 }
@@ -320,6 +322,8 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
         if (!offscreen && (data = get_win_data( hwnd )))
         {
             attach_client_window( data, surface->window );
+            /* WS: gattach row: WARN-only instrument, no behavior change */
+            WARN( "WS: gattach hwnd %p window %lx\n", hwnd, surface->window );
             release_win_data( data );
         }
         return;
@@ -363,8 +367,18 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
 
     if ((data = get_win_data( hwnd )))
     {
-        if (offscreen) detach_client_window( data, surface->window );
-        else attach_client_window( data, surface->window );
+        if (offscreen)
+        {
+            detach_client_window( data, surface->window );
+            /* WS: gdetach row: WARN-only instrument, no behavior change */
+            WARN( "WS: gdetach hwnd %p window %lx\n", hwnd, surface->window );
+        }
+        else
+        {
+            attach_client_window( data, surface->window );
+            /* WS: gattach row: WARN-only instrument, no behavior change */
+            WARN( "WS: gattach hwnd %p window %lx\n", hwnd, surface->window );
+        }
         release_win_data( data );
     }
 }
@@ -375,6 +389,30 @@ static void x11drv_client_surface_update( struct client_surface *client )
     HWND hwnd = client->hwnd;
 
     client_surface_update_geometry( hwnd, surface );
+
+    /* WS: gx11 row: WARN-only instrument, no behavior change. Emits on change only: geo digest covers
+     * x/y/width/height of the struct fields the geometry manager writes (surface->changes); the map
+     * flag is client.offscreen (the attach/detach state). Stamps stored only when a row is emitted. */
+    {
+        RECT rect = surface->client.raw ? surface->client.monitor_rect : surface->client.virtual_rect;
+        unsigned int offscreen = surface->client.offscreen ? 1 : 0;
+        unsigned int map_changed = (offscreen != (unsigned int)surface->last_map_state);
+        DWORD geo = ((unsigned int)surface->changes.x * 214013u) ^
+                    ((unsigned int)surface->changes.y * 2531011u) ^
+                    ((unsigned int)surface->changes.width * 1000003u) ^
+                    ((unsigned int)surface->changes.height * 83492791u);
+        unsigned int geo_changed = (geo != surface->last_geo);
+
+        if ((map_changed || geo_changed) &&
+            rect.right - rect.left >= 300 && rect.bottom - rect.top >= 200)
+        {
+            WARN( "WS: gx11 hwnd %p window %lx map_changed %u geo_changed %u offscreen %u\n",
+                  hwnd, surface->window, map_changed, geo_changed, offscreen );
+            surface->last_map_state = (DWORD)offscreen;
+            surface->last_geo = geo;
+        }
+    }
+
     client_surface_update_offscreen( hwnd, surface );
 }
 
