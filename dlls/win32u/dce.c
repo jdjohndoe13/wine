@@ -578,6 +578,9 @@ struct window_surface *window_surface_create( const struct window_surface_funcs 
 
     memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
 
+    WARN( "WS: fresh surface %p hwnd %p rect %s color_bitmap %p white-filled\n", surface, surface->hwnd,
+          wine_dbgstr_rect( &surface->rect ), surface->color_bitmap );
+
     TRACE( "created surface %p for hwnd %p rect %s\n", surface, hwnd, wine_dbgstr_rect( &surface->rect ) );
     return surface;
 }
@@ -613,6 +616,12 @@ void window_surface_unlock( struct window_surface *surface )
     pthread_mutex_unlock( &surface->mutex );
 }
 
+/* W2 instrumentation: big-surface probe helper, no behavior change */
+static BOOL ws_probe_big( const struct window_surface *surface )
+{
+    return surface && surface->rect.right - surface->rect.left >= 300 && surface->rect.bottom - surface->rect.top >= 200;
+}
+
 void window_surface_flush( struct window_surface *surface )
 {
     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -643,6 +652,26 @@ void window_surface_flush( struct window_surface *surface )
         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
                                    shape_changed, shape_info, shape_bits ))
             reset_bounds( &surface->bounds );
+
+        if (ws_probe_big( surface ) && color_info->bmiHeader.biBitCount == 32)
+        {
+            LONG width = color_info->bmiHeader.biWidth, rows = color_info->bmiHeader.biHeight;
+            LONG stride;
+            UINT white = 0, i, px, py;
+            const BYTE *bits = (const BYTE *)color_bits;
+
+            if (rows < 0) rows = -rows;
+            stride = rows ? (LONG)(color_info->bmiHeader.biSizeImage / rows) : 0;
+            if (width > 0 && rows > 0 && stride > 0)
+                for (i = 0; i < 64; i++)
+                {
+                    px = (i & 7) * (width - 1) / 8;
+                    py = (i >> 3) * (rows - 1) / 8;
+                    if ((*(const DWORD *)(bits + (DWORD_PTR)py * stride + (DWORD_PTR)px * 4) & 0x00ffffff) == 0x00ffffff) white++;
+                }
+            WARN( "WS: flush hwnd %p bitmap %p bounds %s dirty %s white %u/%u\n", surface->hwnd, surface->color_bitmap,
+                  wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ), white, (UINT)64 );
+        }
     }
 
     window_surface_unlock( surface );

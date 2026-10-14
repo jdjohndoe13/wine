@@ -640,12 +640,14 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
 
         /* surface wasn't used, it shouldn't be in any list */
         list_add_tail( &client_surfaces, &surface->entry );
+        WARN( "WS: attach client surface %s hwnd %p\n", debugstr_client_surface( surface ), surface->hwnd );
         client_surface_update_locked( surface );
     }
     else
     {
         list_remove( &surface->entry ); /* remove it from client_surfaces, if it was used */
         list_add_head( &unused_surfaces, &surface->entry ); /* add it to the head, so we discard older ones */
+        WARN( "WS: park client surface %s hwnd %p (content retained)\n", debugstr_client_surface( surface ), surface->hwnd );
         client_surface_add_ref( surface );
     }
 
@@ -2584,6 +2586,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     if (ret)
     {
         TRACE( "win %p surface %p -> %p\n", hwnd, old_surface, new_surface );
+        WARN( "WS: swp hwnd %p old_surface %p new_surface %p flags %04x show %u hide %u\n", hwnd, old_surface,
+              new_surface, swp_flags, !!(swp_flags & SWP_SHOWWINDOW), !!(swp_flags & SWP_HIDEWINDOW) );
         register_window_surface( old_surface, new_surface );
         if (old_surface)
         {
