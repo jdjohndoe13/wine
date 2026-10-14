@@ -2359,6 +2359,7 @@ void detach_client_window( struct x11drv_win_data *data, Window client_window )
     }
 
     data->client_window = 0;
+    WARN( "WS: detach client window %lx hwnd %p\n", client_window, data->hwnd );
 }
 
 
@@ -2381,6 +2382,7 @@ void attach_client_window( struct x11drv_win_data *data, Window client_window )
     }
 
     data->client_window = client_window;
+    WARN( "WS: attach client window %lx hwnd %p\n", client_window, data->hwnd );
 }
 
 
