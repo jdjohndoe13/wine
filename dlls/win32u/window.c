@@ -687,6 +687,78 @@ static void ws_reattach_compose_surface( HWND hwnd, HWND surface_win, const char
     WARN( "WS: reattach hwnd %p rect %s surface %p hook %s\n", hwnd, wine_dbgstr_rect( &rect ), surface, hook );
 }
 
+/* W5 white-out fix: find an attached client surface on the window itself or, failing that,
+ * anywhere in its child subtree (bounded to depth 5, no list loops). Returns the surface with an
+ * extra reference the caller must release, and sets *surf_hwnd to the surface owner window found.
+ * No visibility requirement — the caller gates. */
+static struct client_surface *ws_find_attached_surface_subtree( HWND hwnd, UINT depth, HWND *surf_hwnd )
+{
+    struct client_surface *surface;
+    HWND *list;
+    UINT i;
+
+    if (depth > 5) return NULL;
+
+    /* attached on the window itself? (same client_surfaces scan as W4 ws_client_surface_attached) */
+    pthread_mutex_lock( &surfaces_lock );
+    LIST_FOR_EACH_ENTRY( surface, &client_surfaces, struct client_surface, entry )
+        if (surface->hwnd == hwnd)
+        {
+            if (surf_hwnd) *surf_hwnd = hwnd;
+            client_surface_add_ref( surface ); /* held until the caller releases it */
+            break;
+        }
+    pthread_mutex_unlock( &surfaces_lock );
+
+    if (&surface->entry != &client_surfaces) return surface;
+
+    /* else search the child subtree, same enumeration idiom as dce.c ws_probe_big */
+    if ((list = list_window_children( hwnd )))
+    {
+        for (i = 0; list[i]; i++)
+            if ((surface = ws_find_attached_surface_subtree( list[i], depth + 1, surf_hwnd )))
+            {
+                free( list );
+                return surface;
+            }
+        free( list );
+    }
+    return NULL;
+}
+
+/* W5 white-out fix (style-path show hook): the app's visibility flips ride SetWindowLong /
+ * set_window_style_bits and never reach set_window_pos with SWP_SHOWWINDOW, so the attached
+ * client surface (canvas child) content stays unpresented in the composition at show time.
+ * Recompose it on the root window_surface and force one immediate present of the client
+ * surface. No geometry, z-order or server state is touched here. */
+static void ws_compose_on_show( HWND hwnd, const char *hook )
+{
+    struct client_surface *surface;
+    HWND surf_hwnd, root;
+    WND *win;
+
+    if (!(surface = ws_find_attached_surface_subtree( hwnd, 0, &surf_hwnd ))) return;
+
+    root = NtUserGetAncestor( hwnd, GA_ROOT );
+    if (!(win = get_win_ptr( root )) || win == WND_DESKTOP)
+    {
+        client_surface_release( surface );
+        return;
+    }
+    if (win == WND_OTHER_PROCESS)
+    {
+        client_surface_release( surface );
+        WARN( "WS: redirty hook %s hwnd %p skipped cross-proc\n", hook, hwnd );
+        return;
+    }
+    release_win_ptr( win );
+
+    ws_reattach_compose_surface( surf_hwnd, root, hook );
+    client_surface_present( surface );
+    WARN( "WS: redirty hook %s hwnd %p subtree %p surface %p root %p\n", hook, hwnd, surf_hwnd, surface, root );
+    client_surface_release( surface );
+}
+
 void use_window_client_surface( struct client_surface *surface, BOOL use )
 {
     HWND attach_hwnd = 0;
@@ -1674,7 +1746,7 @@ static BOOL server_set_window_info( HWND hwnd, INT offset, LONG_PTR newval, UINT
 
 UINT set_window_style_bits( HWND hwnd, UINT set_bits, UINT clear_bits )
 {
-    BOOL ok, ansi = FALSE, made_visible = FALSE;
+    BOOL ok, ansi = FALSE, made_visible = FALSE, visible_increased = FALSE;
     STYLESTRUCT style;
     LONG_PTR oldval;
     WND *win = get_win_ptr( hwnd );
@@ -1702,11 +1774,16 @@ UINT set_window_style_bits( HWND hwnd, UINT set_bits, UINT clear_bits )
     if (ok && ((style.styleOld ^ style.styleNew) & WS_VISIBLE))
     {
         made_visible = (style.styleNew & WS_VISIBLE) != 0;
+        visible_increased = !(style.styleOld & WS_VISIBLE) && (style.styleNew & WS_VISIBLE);
         invalidate_dce( win, NULL );
     }
     release_win_ptr( win );
 
     if (!ok) return 0;
+
+    /* W5: style-path shows never carry a SWP_SHOWWINDOW through set_window_pos — recompose the
+     * attached client surface subtree right where the flip is committed (win ptr released) */
+    if (visible_increased) ws_compose_on_show( hwnd, "style-pty" );
 
     user_driver->pSetWindowStyle( hwnd, GWL_STYLE, &style );
     if (made_visible) update_window_state( hwnd );
@@ -1882,6 +1959,11 @@ static LONG_PTR set_window_long_internal( HWND hwnd, INT offset, UINT size,
         user_driver->pSetWindowStyle( hwnd, offset, &style );
         if (made_visible || layered) update_window_state( hwnd );
         send_message( hwnd, WM_STYLECHANGED, offset, (LPARAM)&style );
+        /* W5: GWL_STYLE shows ride this path, never set_window_pos + SWP_SHOWWINDOW — recompose
+         * the attached client surface subtree right where the flip is committed (win ptr
+         * released; oldval is the server-confirmed pre-commit style, newval the committed one) */
+        if (offset == GWL_STYLE && !(oldval & WS_VISIBLE) && (newval & WS_VISIBLE))
+            ws_compose_on_show( hwnd, "longstyle" );
     }
 
     if (offset == GWLP_WNDPROC) return (ULONG_PTR)get_window_proc( (WNDPROC)retval, old_ansi, ansi );
@@ -2663,14 +2745,30 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         TRACE( "win %p surface %p -> %p\n", hwnd, old_surface, new_surface );
         WARN( "WS: swp hwnd %p old_surface %p new_surface %p flags %04x show %u hide %u\n", hwnd, old_surface,
               new_surface, swp_flags, !!(swp_flags & SWP_SHOWWINDOW), !!(swp_flags & SWP_HIDEWINDOW) );
-        /* W4 white-out fix (show hook): when a child window's visibility increases (hidden ->
-         * shown) it may have been painted over while hidden, leaving overpainted content in the
-         * composition surface; if the window has a client surface attached, mark its rect dirty
-         * on the surface owner and request a flush so the content gets recomposed. */
+        /* W5 white-out fix (show hook): widen the W4 show hook beyond the flipping node itself —
+         * the attached client surface usually lives on a descendant (canvas child) and is still
+         * attached (never parked) at show time. Keep the W4 row verbatim (hook "show") for the
+         * node case, and add the subtree case (mapping window = the surface owner found in the
+         * subtree) plus one forced client present (tag "show-attach") to catch the parked case. */
         if ((old_style & WS_CHILD) && (new_style & WS_VISIBLE) &&
-            (!(old_style & WS_VISIBLE) || (swp_flags & SWP_SHOWWINDOW)) &&
-            ws_client_surface_attached( hwnd ))
-            ws_reattach_compose_surface( hwnd, surface_win, "show" );
+            (!(old_style & WS_VISIBLE) || (swp_flags & SWP_SHOWWINDOW)))
+        {
+            HWND surf_hwnd = 0;
+            struct client_surface *sub_surface = ws_find_attached_surface_subtree( hwnd, 0, &surf_hwnd );
+
+            if (ws_client_surface_attached( hwnd ))
+                ws_reattach_compose_surface( hwnd, surface_win, "show" );
+            else if (sub_surface)
+                ws_reattach_compose_surface( surf_hwnd, surface_win, "show-attach" );
+
+            if (sub_surface)
+            {
+                client_surface_present( sub_surface );
+                WARN( "WS: redirty hook show-attach hwnd %p subtree %p surface %p root %p\n", hwnd,
+                      surf_hwnd, sub_surface, NtUserGetAncestor( hwnd, GA_ROOT ) );
+                client_surface_release( sub_surface );
+            }
+        }
         register_window_surface( old_surface, new_surface );
         if (old_surface)
         {
