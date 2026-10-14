@@ -982,14 +982,10 @@ static void update_visible_region( struct dce *dce )
               dce->hwnd, dce->flags, wine_dbgstr_rect( &vis_box ) );
     }
 
-    /* W6 white-out fix: CLIPCHILDREN parent DC refreshes must exclude attached client-surface
-     * child rects (Windows semantics). Insert point: after the 'WS: vis' instrument row, before
-     * set_visible_region — vis_rgn is still in SCREEN coords here (the server maps the reply
-     * region to screen, server/window.c:2914; set_visible_region does the -win_rect offset
-     * itself, clipping.c:217), so exclusion rects are taken directly in screen coords
-     * (Formula B), same space as the dce->clip_rgn combine above. */
-    if ((dce->flags & DCX_CLIPCHILDREN) && !is_desktop_window( dce->hwnd ))
-        ws_clipchild_children_excl( dce->hwnd, vis_rgn );
+    /* W6 white-out fix REVERTED (oracle round 6): cross-process wall — the client_surfaces list
+     * is per-process; the canvas child's surface lives in the msedge process, the whitening in
+     * the Dr.Explain process, so the parent-side exclusion could never see the surface.
+     * Replaced by the W7 child-side present hook (see release_dce / ws_w7_flush below). */
 
     set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface );
     if (surface) window_surface_release( surface );
@@ -1000,7 +996,9 @@ static void update_visible_region( struct dce *dce )
  */
 static void release_dce( struct dce *dce )
 {
-    if (!dce->hwnd) return;  /* already released */
+    HWND hwnd = dce->hwnd;
+
+    if (!hwnd) return;  /* already released */
 
     set_visible_region( dce->hdc, 0, &dummy_surface.rect, &dummy_surface.rect, &dummy_surface );
     user_driver->pReleaseDC( dce->hwnd, dce->hdc );
@@ -1009,6 +1007,11 @@ static void release_dce( struct dce *dce )
     dce->clip_rgn = 0;
     dce->hwnd     = 0;
     dce->flags   &= DCX_CACHE;
+
+    /* W7: arm the deferred client-surface present for this window (the present itself must not
+     * run here — we are under the user lock and inside dce_list iteration; see the W7 comment
+     * in window.c). The arm only records the hwnd when the window has no real window surface. */
+    ws_w7_arm_client_surface( hwnd );
 }
 
 /***********************************************************************
@@ -1234,6 +1237,9 @@ void free_dce( struct dce *dce, HWND hwnd, struct list *drawables )
         NtGdiDeleteObjectApp( dce_to_free->hdc );
         free( dce_to_free );
     }
+
+    /* W7: run the deferred client-surface present armed by the release_dce calls above */
+    ws_w7_flush_client_surface_present();
 }
 
 BOOL is_cache_dc( HDC hdc )
@@ -1362,6 +1368,11 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
         ret = TRUE;
     }
     user_unlock();
+
+    /* W7: run the deferred client-surface present armed by release_dce (we are outside the
+     * user lock here; client_surface_present takes surfaces_lock -> user_lock, the order the
+     * existing attach/show hooks already use). */
+    ws_w7_flush_client_surface_present();
 
     release_opengl_drawables( &drawables );
     return ret;

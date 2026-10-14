@@ -738,94 +738,102 @@ static struct client_surface *ws_find_attached_surface_subtree( HWND hwnd, UINT 
     return NULL;
 }
 
-/* W6 white-out fix: exclude the rects of children carrying an attached client surface from the
- * CLIPCHILDREN parent DC refresh region. Windows semantics: a WS_CLIPCHILDREN parent must not
- * erase/paint over its child areas; the app-side white erase was painting over the attached
- * client-surface canvas child region.
- * Coordinate mode Formula B: the exclusion rects are taken directly in SCREEN coordinates.
- * Evidence: the server get_visible_region handler maps the reply region to screen coords
- * (server/window.c:2914 map_win_region_to_screen — built window-relative, then offset by the
- * window's screen position), and set_visible_region() does the -vis_rect offset itself, later,
- * inside the call (clipping.c:217). So at the dce.c combine point vis_rgn lives in screen coords,
- * the same space as the existing dce->clip_rgn combine; the server's own DCX_CLIPCHILDREN family
- * subtracts the child visible_rect (server/window.c:1215), hence rects.visible here. */
-UINT ws_clipchild_children_excl( HWND parent, HRGN vis_rgn )
-{
-    struct client_surface *surface;
-    HWND hwnds[32]; /* bounded snapshot, no allocation */
-    UINT count = 0, i, applied = 0;
-    struct ratio dpi = get_thread_dpi();
+/* W7 white-out fix (dce-release hook): a child window that renders via a client surface has no
+ * own win32u window surface (win->surface is NULL — children use the parent surface — or the
+ * dummy one); when its DCE is released (the paint is done), the parent composition may still hold
+ * stale content over the child rect. Arm a deferred client-surface present: release_dce() runs
+ * with the user lock held and inside dce_list iteration, so the present cannot run there —
+ * client_surface_present() takes surfaces_lock and then the user lock (via NtUserGetAncestor /
+ * get_win_ptr), the reverse order would be an ABBA deadlock against the established
+ * surfaces_lock -> user_lock order, and a present in the middle of a dce_list walk would
+ * re-enter DC code. The arm only records the hwnd (pending slot, own lock); the present runs at
+ * the next DCE release / ReleaseDC outside the user lock, where the surfaces_lock -> user_lock
+ * order is the established one. The park path (use_window_client_surface) keeps the hwnd on the
+ * unused-list entry, so a parked surface can still be matched by hwnd. */
+static pthread_mutex_t ws_w7_pending_lock = PTHREAD_MUTEX_INITIALIZER;
+static HWND ws_w7_pending_hwnd;
+static LONG ws_w7_in_flush;
 
-    /* pass 1: snapshot the surface-owner window handles; all other work happens outside the
-     * surfaces_lock (no win32u/server/gdi calls under it). List membership is the W4 'attached'
-     * definition, so ws_client_surface_attached() is subsumed by the snapshot. */
+void ws_w7_arm_client_surface( HWND hwnd )
+{
+    WND *win;
+
+    if (ws_w7_in_flush) return; /* re-entrant arm from the present itself, skip */
+
+    /* the released window must not own a real window surface: it renders via a client surface */
+    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
+    if (win->surface && win->surface != &dummy_surface)
+    {
+        release_win_ptr( win );
+        return;
+    }
+    release_win_ptr( win );
+
+    pthread_mutex_lock( &ws_w7_pending_lock );
+    if (!ws_w7_pending_hwnd) ws_w7_pending_hwnd = hwnd;
+    pthread_mutex_unlock( &ws_w7_pending_lock );
+}
+
+void ws_w7_flush_client_surface_present( void )
+{
+    struct client_surface *surface = NULL;
+    UINT parked = 0;
+    HWND hwnd;
+
+    if (InterlockedCompareExchange( &ws_w7_in_flush, 1, 0 )) return; /* already flushing */
+
+    /* the flush must run outside the user lock: client_surface_present() takes surfaces_lock
+     * and then the user lock (via NtUserGetAncestor / get_win_ptr); running it while the user
+     * lock is held would be the reverse (user -> surfaces) order, i.e. ABBA */
+    if (user_is_locked())
+    {
+        InterlockedExchange( &ws_w7_in_flush, 0 );
+        return;
+    }
+
+    pthread_mutex_lock( &ws_w7_pending_lock );
+    hwnd = ws_w7_pending_hwnd;
+    ws_w7_pending_hwnd = 0;
+    pthread_mutex_unlock( &ws_w7_pending_lock );
+
+    if (!hwnd)
+    {
+        InterlockedExchange( &ws_w7_in_flush, 0 );
+        return;
+    }
+
+    /* find the client surface for the window: the attached list first, then the parked
+     * (unused) list; the park path keeps the hwnd, so a parked entry can still be matched */
     pthread_mutex_lock( &surfaces_lock );
     LIST_FOR_EACH_ENTRY( surface, &client_surfaces, struct client_surface, entry )
+        if (surface->hwnd == hwnd) break;
+    if (&surface->entry != &client_surfaces) parked = 0;
+    else
     {
-        if (&surface->entry == &client_surfaces || count == ARRAY_SIZE( hwnds )) break;
-        if (!surface->hwnd || surface->hwnd == parent) continue;
-        hwnds[count++] = surface->hwnd;
+        LIST_FOR_EACH_ENTRY( surface, &unused_surfaces, struct client_surface, entry )
+            if (surface->hwnd == hwnd) break;
+        if (&surface->entry != &unused_surfaces) parked = 1;
+        else surface = NULL;
     }
+
+    /* throttle: only present when the surface is flagged updated (geometry changed or the
+     * Track-3 purge marked it); the flag is not consumed here — opengl get_size owns it */
+    if (surface && !surface->updated)
+    {
+        surface = NULL;
+    }
+    else if (surface) client_surface_add_ref( surface );
+
     pthread_mutex_unlock( &surfaces_lock );
 
-    /* WS: xcl-scan row: WARN-only instrument, no behavior change. n_snap = snapshot count,
-     * n_child = number of children of the parent via the same child-list idiom used elsewhere
-     * in window.c (list_window_children). */
+    if (surface)
     {
-        UINT n_child = 0;
-        HWND *kids = list_window_children( parent );
-        if (kids)
-        {
-            UINT k;
-            for (k = 0; kids[k]; k++) n_child++;
-            free( kids );
-        }
-        WARN( "WS: xcl-scan parent %p flags %x n_snap %d n_child %d\n",
-              parent, get_window_long( parent, GWL_STYLE ), count, n_child );
+        WARN( "WS: present-nil hwnd %p parked %u\n", hwnd, parked );
+        client_surface_present( surface );
+        client_surface_release( surface );
     }
 
-    for (i = 0; i < count; i++)
-    {
-        HWND hwnd = hwnds[i];
-        struct window_rects rects;
-        HRGN child_rgn;
-
-        if (!is_child( parent, hwnd )) continue;
-
-        /* WS: xcl-cand row: WARN-only instrument, no behavior change. Logged before the
-         * visibility/transparent/empty-rect filters; rects fetched with the same idiom as
-         * below, results ignored (the filters re-fetch as usual). */
-        {
-            struct window_rects log_rects;
-            SetRectEmpty( &log_rects.visible );
-            SetRectEmpty( &log_rects.window );
-            get_window_rects( hwnd, COORDS_SCREEN, &log_rects, dpi );
-            WARN( "WS: xcl-cand child %p vis %d trans %d visrect %s winrect %s\n",
-                  hwnd, is_window_visible( hwnd ),
-                  !!(get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT),
-                  wine_dbgstr_rect( &log_rects.visible ), wine_dbgstr_rect( &log_rects.window ) );
-        }
-
-        /* skip family mirrors the server's own clip_children loop: hidden children are not
-         * clipped out server-side (server/window.c:1213-1214); is_window_visible() covers the
-         * ancestor chain, and WS_EX_TRANSPARENT children stay paintable through */
-        if (!is_window_visible( hwnd )) continue;
-        if (get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT) continue;
-
-        if (!get_window_rects( hwnd, COORDS_SCREEN, &rects, dpi )) continue;
-        if (IsRectEmpty( &rects.visible )) continue;
-
-        if (!(child_rgn = NtGdiCreateRectRgn( rects.visible.left, rects.visible.top,
-                                              rects.visible.right, rects.visible.bottom )))
-            continue;
-        NtGdiCombineRgn( vis_rgn, vis_rgn, child_rgn, RGN_DIFF );
-        NtGdiDeleteObjectApp( child_rgn );
-        applied++;
-        WARN( "WS: xcl-add parent %p child %p child_rect_screen %s vis_rgn %p\n",
-              parent, hwnd, wine_dbgstr_rect( &rects.visible ), vis_rgn );
-    }
-
-    return applied;
+    InterlockedExchange( &ws_w7_in_flush, 0 );
 }
 
 /* W5 white-out fix (style-path show hook): the app's visibility flips ride SetWindowLong /

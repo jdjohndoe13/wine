@@ -352,6 +352,12 @@ void user_check_not_lock(void)
     }
 }
 
+/* TRUE if the current thread holds the (recursive) USER lock */
+BOOL user_is_locked(void)
+{
+    return user_lock_thread == GetCurrentThreadId();
+}
+
 static HANDLE get_display_device_init_mutex( void )
 {
     WCHAR bufferW[256];
