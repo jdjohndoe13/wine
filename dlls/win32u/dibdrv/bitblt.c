@@ -889,10 +889,39 @@ DWORD dibdrv_GetImage( PHYSDEV dev, BITMAPINFO *info, struct gdi_image_bits *bit
                        struct bitblt_coords *src )
 {
     dibdrv_physdev *pdev = get_dibdrv_pdev(dev);
+    DWORD ret;
 
     TRACE( "%p %p\n", dev, info );
 
-    return get_image_dib_info( &pdev->dib, info, bits, src );
+    ret = get_image_dib_info( &pdev->dib, info, bits, src );
+
+    /* WS: srcpx row: WARN-only instrument, no behavior change. Samples four pixels from the
+     * source DIB memory fast path: get_image_dib_info resolved bits->ptr to point directly
+     * into the DIB (stride is signed and may be negative for bottom-up dibs). */
+    if (ret == ERROR_SUCCESS && bits && bits->ptr &&
+        pdev->dib.bit_count == 32 &&
+        pdev->dib.width >= 300 && pdev->dib.height >= 200)
+    {
+        static DWORD ws_last_srcpx;
+        DWORD ws_now = NtGetTickCount();
+        if (ws_now - ws_last_srcpx > 250)
+        {
+            int ws_mid_y = pdev->dib.height / 2;
+            const DWORD *ws_mid = (const DWORD *)((char *)bits->ptr + ws_mid_y * pdev->dib.stride);
+            const DWORD *ws_top = (const DWORD *)((char *)bits->ptr + pdev->dib.stride);
+            unsigned int ws_w = (unsigned int)pdev->dib.width, ws_h = (unsigned int)pdev->dib.height;
+            DWORD ws_m0 = ws_mid[0];
+            DWORD ws_m1 = ws_mid[ws_w / 2];
+            DWORD ws_m2 = ws_mid[ws_w - 1];
+            DWORD ws_t0 = ws_top[8];
+
+            ws_last_srcpx = ws_now;
+            WARN( "WS: srcpx pdev %p w %u h %u mid %08x %08x %08x top %08x\n",
+                  pdev, ws_w, ws_h, ws_m0, ws_m1, ws_m2, ws_t0 );
+        }
+    }
+
+    return ret;
 }
 
 static BOOL matching_color_info( const dib_info *dib, const BITMAPINFO *info, BOOL allow_mask_rect )
