@@ -826,6 +826,17 @@ void flush_window_surfaces( BOOL idle )
 
     pthread_mutex_lock( &surfaces_lock );
     now = NtGetTickCount();
+
+    /* WS: idleflush row: WARN-only instrument, no behavior change */
+    {
+        static DWORD ws_last_idleflush;
+        if (now - ws_last_idleflush > 2000)
+        {
+            ws_last_idleflush = now;
+            WARN( "WS: idleflush n_surfaces %u\n", list_count( &window_surfaces ) );
+        }
+    }
+
     if (idle) last_idle = now;
     /* if not idle, we only flush if there's evidence that the app never goes idle */
     else if ((int)(now - last_idle) < 50) goto done;

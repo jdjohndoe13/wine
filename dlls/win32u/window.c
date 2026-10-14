@@ -576,6 +576,18 @@ void client_surface_present( struct client_surface *surface )
     HWND hwnd;
 
     pthread_mutex_lock( &surfaces_lock );
+
+    /* WS: presentq row: WARN-only instrument, no behavior change */
+    {
+        static DWORD ws_last_presentq;
+        DWORD ws_now = NtGetTickCount();
+        if (ws_now - ws_last_presentq > 1000)
+        {
+            ws_last_presentq = ws_now;
+            WARN( "WS: presentq hwnd %p surface %p\n", surface->hwnd, surface );
+        }
+    }
+
     if ((hwnd = surface->hwnd))
     {
         client_surface_update_locked( surface );
