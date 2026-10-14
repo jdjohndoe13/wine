@@ -738,6 +738,65 @@ static struct client_surface *ws_find_attached_surface_subtree( HWND hwnd, UINT 
     return NULL;
 }
 
+/* W6 white-out fix: exclude the rects of children carrying an attached client surface from the
+ * CLIPCHILDREN parent DC refresh region. Windows semantics: a WS_CLIPCHILDREN parent must not
+ * erase/paint over its child areas; the app-side white erase was painting over the attached
+ * client-surface canvas child region.
+ * Coordinate mode Formula B: the exclusion rects are taken directly in SCREEN coordinates.
+ * Evidence: the server get_visible_region handler maps the reply region to screen coords
+ * (server/window.c:2914 map_win_region_to_screen — built window-relative, then offset by the
+ * window's screen position), and set_visible_region() does the -vis_rect offset itself, later,
+ * inside the call (clipping.c:217). So at the dce.c combine point vis_rgn lives in screen coords,
+ * the same space as the existing dce->clip_rgn combine; the server's own DCX_CLIPCHILDREN family
+ * subtracts the child visible_rect (server/window.c:1215), hence rects.visible here. */
+UINT ws_clipchild_children_excl( HWND parent, HRGN vis_rgn )
+{
+    struct client_surface *surface;
+    HWND hwnds[32]; /* bounded snapshot, no allocation */
+    UINT count = 0, i, applied = 0;
+    struct ratio dpi = get_thread_dpi();
+
+    /* pass 1: snapshot the surface-owner window handles; all other work happens outside the
+     * surfaces_lock (no win32u/server/gdi calls under it). List membership is the W4 'attached'
+     * definition, so ws_client_surface_attached() is subsumed by the snapshot. */
+    pthread_mutex_lock( &surfaces_lock );
+    LIST_FOR_EACH_ENTRY( surface, &client_surfaces, struct client_surface, entry )
+    {
+        if (&surface->entry == &client_surfaces || count == ARRAY_SIZE( hwnds )) break;
+        if (!surface->hwnd || surface->hwnd == parent) continue;
+        hwnds[count++] = surface->hwnd;
+    }
+    pthread_mutex_unlock( &surfaces_lock );
+
+    for (i = 0; i < count; i++)
+    {
+        HWND hwnd = hwnds[i];
+        struct window_rects rects;
+        HRGN child_rgn;
+
+        if (!is_child( parent, hwnd )) continue;
+        /* skip family mirrors the server's own clip_children loop: hidden children are not
+         * clipped out server-side (server/window.c:1213-1214); is_window_visible() covers the
+         * ancestor chain, and WS_EX_TRANSPARENT children stay paintable through */
+        if (!is_window_visible( hwnd )) continue;
+        if (get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT) continue;
+
+        if (!get_window_rects( hwnd, COORDS_SCREEN, &rects, dpi )) continue;
+        if (IsRectEmpty( &rects.visible )) continue;
+
+        if (!(child_rgn = NtGdiCreateRectRgn( rects.visible.left, rects.visible.top,
+                                              rects.visible.right, rects.visible.bottom )))
+            continue;
+        NtGdiCombineRgn( vis_rgn, vis_rgn, child_rgn, RGN_DIFF );
+        NtGdiDeleteObjectApp( child_rgn );
+        applied++;
+        WARN( "WS: xcl-add parent %p child %p child_rect_screen %s vis_rgn %p\n",
+              parent, hwnd, wine_dbgstr_rect( &rects.visible ), vis_rgn );
+    }
+
+    return applied;
+}
+
 /* W5 white-out fix (style-path show hook): the app's visibility flips ride SetWindowLong /
  * set_window_style_bits and never reach set_window_pos with SWP_SHOWWINDOW, so the attached
  * client surface (canvas child) content stays unpresented in the composition at show time.
