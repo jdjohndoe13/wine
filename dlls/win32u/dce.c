@@ -973,6 +973,15 @@ static void update_visible_region( struct dce *dce )
               wine_dbgstr_rect( &vis_box ), wine_dbgstr_rect( &win_rect ), top_win, surface );
     }
 
+    /* W6 white-out fix: CLIPCHILDREN parent DC refreshes must exclude attached client-surface
+     * child rects (Windows semantics). Insert point: after the 'WS: vis' instrument row, before
+     * set_visible_region — vis_rgn is still in SCREEN coords here (the server maps the reply
+     * region to screen, server/window.c:2914; set_visible_region does the -win_rect offset
+     * itself, clipping.c:217), so exclusion rects are taken directly in screen coords
+     * (Formula B), same space as the dce->clip_rgn combine above. */
+    if ((dce->flags & DCX_CLIPCHILDREN) && !is_desktop_window( dce->hwnd ))
+        ws_clipchild_children_excl( dce->hwnd, vis_rgn );
+
     set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface );
     if (surface) window_surface_release( surface );
 }
