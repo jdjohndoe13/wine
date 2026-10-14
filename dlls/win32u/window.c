@@ -623,8 +623,74 @@ BOOL client_surface_get_size( struct client_surface *surface, SIZE *virtual_size
     return updated;
 }
 
+/* W4 white-out fix: when a child window's visibility increases (hidden -> shown) or its client
+ * surface re-attaches, the composition surface may still hold content painted over its rect while
+ * it was hidden; mark that rect dirty on the surface owner and request a flush so the content gets
+ * recomposed. Rect mapping mirrors expose_window_surface(). */
+static BOOL ws_client_surface_attached( HWND hwnd )
+{
+    struct client_surface *surface;
+
+    pthread_mutex_lock( &surfaces_lock );
+
+    LIST_FOR_EACH_ENTRY( surface, &client_surfaces, struct client_surface, entry )
+        if (surface->hwnd == hwnd) break;
+
+    pthread_mutex_unlock( &surfaces_lock );
+
+    return &surface->entry != &client_surfaces;
+}
+
+static void ws_reattach_compose_surface( HWND hwnd, HWND surface_win, const char *hook )
+{
+    struct window_rects child_rects, owner_rects;
+    struct window_surface *surface;
+    struct ratio dpi = get_thread_dpi();
+    WND *owner;
+    RECT rect;
+
+    if (!(owner = get_win_ptr( surface_win )) || owner == WND_DESKTOP || owner == WND_OTHER_PROCESS) return;
+
+    /* only real window surfaces have a composition bitmap to redirty, dummy ones have none */
+    if (!(surface = owner->surface) || surface == &dummy_surface)
+    {
+        release_win_ptr( owner );
+        return;
+    }
+    window_surface_add_ref( surface );
+    release_win_ptr( owner );
+
+    if (!get_window_rects( hwnd, COORDS_SCREEN, &child_rects, dpi ) ||
+        !get_window_rects( surface_win, COORDS_SCREEN, &owner_rects, dpi ))
+    {
+        window_surface_release( surface );
+        return;
+    }
+
+    /* same mapping as expose_window_surface(): surface coords are relative to the owner's visible
+     * rect origin */
+    rect = child_rects.client;
+    OffsetRect( &rect, -owner_rects.visible.left, -owner_rects.visible.top );
+    if (rect.right - rect.left < 300 || rect.bottom - rect.top < 200)  /* same big-rect gate family as dce.c ws_probe_big */
+    {
+        window_surface_release( surface );
+        return;
+    }
+
+    window_surface_lock( surface );
+    intersect_rect( &rect, &rect, &surface->rect );
+    add_bounds_rect( &surface->bounds, &rect );
+    window_surface_unlock( surface );
+    window_surface_flush( surface );
+    window_surface_release( surface );
+
+    WARN( "WS: reattach hwnd %p rect %s surface %p hook %s\n", hwnd, wine_dbgstr_rect( &rect ), surface, hook );
+}
+
 void use_window_client_surface( struct client_surface *surface, BOOL use )
 {
+    HWND attach_hwnd = 0;
+
     TRACE( "surface %s, use %u\n", debugstr_client_surface( surface ), use );
 
     pthread_mutex_lock( &surfaces_lock );
@@ -642,6 +708,7 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         list_add_tail( &client_surfaces, &surface->entry );
         WARN( "WS: attach client surface %s hwnd %p\n", debugstr_client_surface( surface ), surface->hwnd );
         client_surface_update_locked( surface );
+        attach_hwnd = surface->hwnd;
     }
     else
     {
@@ -652,6 +719,12 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
     }
 
     pthread_mutex_unlock( &surfaces_lock );
+
+    /* W4 white-out fix (attach hook): the host rect of a freshly attached client surface may have
+     * been painted over while the surface was parked or hidden; recompose it on the surface owner.
+     * Done outside surfaces_lock, the flush takes its own surface mutex. */
+    if (attach_hwnd)
+        ws_reattach_compose_surface( attach_hwnd, NtUserGetAncestor( attach_hwnd, GA_ROOT ), "attach" );
 }
 
 struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL raw )
@@ -2477,6 +2550,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     struct window_rects old_rects;
     RECT extra_rects[3];
     struct window_surface *old_surface;
+    DWORD old_style = 0, new_style = 0;  /* W4: pre/post-commit styles for the reattach show hook */
     HICON icon, icon_small;
     ICONINFO ii, ii_small;
 
@@ -2492,6 +2566,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
     old_surface = win->surface;
+    old_style = win->dwStyle;  /* W4: pre-commit style */
     if (old_surface != new_surface) swp_flags |= SWP_FRAMECHANGED;  /* force refreshing non-client area */
 
     if (new_surface == &dummy_surface) swp_flags |= SWP_NOREDRAW;
@@ -2580,6 +2655,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         }
     }
 
+    new_style = win->dwStyle;  /* W4: post-commit style (style already applied by the server) */
     release_win_ptr( win );
 
     if (ret)
@@ -2587,6 +2663,14 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         TRACE( "win %p surface %p -> %p\n", hwnd, old_surface, new_surface );
         WARN( "WS: swp hwnd %p old_surface %p new_surface %p flags %04x show %u hide %u\n", hwnd, old_surface,
               new_surface, swp_flags, !!(swp_flags & SWP_SHOWWINDOW), !!(swp_flags & SWP_HIDEWINDOW) );
+        /* W4 white-out fix (show hook): when a child window's visibility increases (hidden ->
+         * shown) it may have been painted over while hidden, leaving overpainted content in the
+         * composition surface; if the window has a client surface attached, mark its rect dirty
+         * on the surface owner and request a flush so the content gets recomposed. */
+        if ((old_style & WS_CHILD) && (new_style & WS_VISIBLE) &&
+            (!(old_style & WS_VISIBLE) || (swp_flags & SWP_SHOWWINDOW)) &&
+            ws_client_surface_attached( hwnd ))
+            ws_reattach_compose_surface( hwnd, surface_win, "show" );
         register_window_surface( old_surface, new_surface );
         if (old_surface)
         {
