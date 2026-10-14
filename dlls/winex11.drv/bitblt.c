@@ -768,6 +768,8 @@ BOOL X11DRV_PatBlt( PHYSDEV dev, struct bitblt_coords *dst, DWORD rop )
     {
     case BLACKNESS:  /* 0x00 */
     case WHITENESS:  /* 0xff */
+        if (rop == WHITENESS)
+            WARN( "WS: WHITENESS hdc %p drawable %lx rect %s\n", dev->hdc, physDev->drawable, wine_dbgstr_rect( &dst->visrect ) );
         if ((physDev->depth != 1) && X11DRV_PALETTE_PaletteToXPixel)
         {
             XSetFunction( gdi_display, physDev->gc, GXcopy );
@@ -1269,6 +1271,22 @@ DWORD X11DRV_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
 
         image->data = dst_bits.ptr;
 
+        if (image->bits_per_pixel == 32 && width >= 300 && height >= 200)
+        {
+            UINT white = 0, i, px, py;
+            const BYTE *img_data = (const BYTE *)image->data;
+
+            for (i = 0; i < 64; i++)
+            {
+                px = (i & 7) * (image->width - 1) / 8;
+                py = (i >> 3) * (image->height - 1) / 8;
+                if ((*(const DWORD *)(img_data + (DWORD_PTR)py * image->bytes_per_line + (DWORD_PTR)px * 4) & 0x00ffffff) == 0x00ffffff) white++;
+            }
+            WARN( "WS: putimage hdc %p drawable %lx dc_rect %s visrect %s white %u/%u rop %x\n", dev->hdc,
+                  physdev->drawable, wine_dbgstr_rect( &physdev->dc_rect ), wine_dbgstr_rect( &dst->visrect ),
+                  white, (UINT)64, rop );
+        }
+
         /* optimization for single-op ROPs */
         if (!opcode[1] && OP_SRCDST(opcode[0]) == OP_ARGS(SRC,DST))
         {
@@ -1373,6 +1391,8 @@ DWORD X11DRV_GetImage( PHYSDEV dev, BITMAPINFO *info,
                        width, height, AllPlanes, ZPixmap );
     if (X11DRV_check_error())
     {
+        WARN( "WS: GetImage drawable %lx BADMATCH - source unreadable, fallback XCopyArea\n", physdev->drawable );
+
         /* use a temporary pixmap to avoid the BadMatch error */
         Pixmap pixmap = XCreatePixmap( gdi_display, root_window, width, height, vis.depth );
         GC gc = XCreateGC( gdi_display, pixmap, 0, NULL );
