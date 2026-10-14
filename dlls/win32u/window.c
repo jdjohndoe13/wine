@@ -768,6 +768,22 @@ UINT ws_clipchild_children_excl( HWND parent, HRGN vis_rgn )
     }
     pthread_mutex_unlock( &surfaces_lock );
 
+    /* WS: xcl-scan row: WARN-only instrument, no behavior change. n_snap = snapshot count,
+     * n_child = number of children of the parent via the same child-list idiom used elsewhere
+     * in window.c (list_window_children). */
+    {
+        UINT n_child = 0;
+        HWND *kids = list_window_children( parent );
+        if (kids)
+        {
+            UINT k;
+            for (k = 0; kids[k]; k++) n_child++;
+            free( kids );
+        }
+        WARN( "WS: xcl-scan parent %p flags %x n_snap %d n_child %d\n",
+              parent, get_window_long( parent, GWL_STYLE ), count, n_child );
+    }
+
     for (i = 0; i < count; i++)
     {
         HWND hwnd = hwnds[i];
@@ -775,6 +791,21 @@ UINT ws_clipchild_children_excl( HWND parent, HRGN vis_rgn )
         HRGN child_rgn;
 
         if (!is_child( parent, hwnd )) continue;
+
+        /* WS: xcl-cand row: WARN-only instrument, no behavior change. Logged before the
+         * visibility/transparent/empty-rect filters; rects fetched with the same idiom as
+         * below, results ignored (the filters re-fetch as usual). */
+        {
+            struct window_rects log_rects;
+            SetRectEmpty( &log_rects.visible );
+            SetRectEmpty( &log_rects.window );
+            get_window_rects( hwnd, COORDS_SCREEN, &log_rects, dpi );
+            WARN( "WS: xcl-cand child %p vis %d trans %d visrect %s winrect %s\n",
+                  hwnd, is_window_visible( hwnd ),
+                  !!(get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT),
+                  wine_dbgstr_rect( &log_rects.visible ), wine_dbgstr_rect( &log_rects.window ) );
+        }
+
         /* skip family mirrors the server's own clip_children loop: hidden children are not
          * clipped out server-side (server/window.c:1213-1214); is_window_visible() covers the
          * ancestor chain, and WS_EX_TRANSPARENT children stay paintable through */
