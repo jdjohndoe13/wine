@@ -776,6 +776,15 @@ void window_surface_set_clip( struct window_surface *surface, HRGN clip_region )
         {
             surface->funcs->set_clip( surface, data->rects, data->numRects );
             GDI_ReleaseObj( clip_region );
+            /* W11 observable: the GC flush clip is being (re)set; the canvas reveal
+             * must show numRects >= 2 (bands around the hole) BEFORE the first
+             * post-reveal WS: flush2 covering the canvas rect */
+            WARN( "WS: w11clip hwnd %p rects %u r0 %ld,%ld-%ld,%ld\n", surface->hwnd,
+                  data->numRects,
+                  data->numRects ? data->rects[0].left : 0,
+                  data->numRects ? data->rects[0].top : 0,
+                  data->numRects ? data->rects[0].right : 0,
+                  data->numRects ? data->rects[0].bottom : 0 );
         }
     }
 
