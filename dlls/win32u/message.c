@@ -2268,6 +2268,11 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
     case WM_WINE_SETPIXELFORMAT:
         set_window_pixel_format( hwnd, wparam, lparam );
         return 0;
+    case WM_WINE_REPRESENT:
+        /* W8: present the client surface attached to this window (the surface lives in
+         * this process; runs without the user lock, so surfaces_lock -> user_lock is fine) */
+        ws_w8_represent_surface( hwnd );
+        return 0;
     case WM_WINE_TRACKMOUSEEVENT:
     {
         TRACKMOUSEEVENT info;
