@@ -3329,12 +3329,17 @@ DECL_HANDLER(set_window_layered_info)
     else set_win32_error( ERROR_INVALID_WINDOW_HANDLE );
 }
 
-/* W8: recursive walk posting WM_WINE_REPRESENT to PAINT_HAS_SURFACE descendants whose
+/* W8: recursive walk posting WM_WINE_REPRESENT to every visible descendant whose
  * window rect intersects the (screen-coords) dirty rect. The canvas child is
  * nested under the WebView2 container, so the walk must recurse through plain children.
  * NOTE: the server stores every window_rect in screen coordinates (the client-side
  * coords are translated by the set_window_pos request), so the walk must run in screen
- * coords too — the caller maps the request's parent-client rect up first. */
+ * coords too — the caller maps the request's parent-client rect up first.
+ * NOTE: the server has NO knowledge of client surfaces (they are a pure client-side
+ * win32u/x11drv mechanism — the creating process never passes a window surface for
+ * them, so neither PAINT_HAS_SURFACE nor PAINT_HAS_PIXEL_FORMAT is set on the canvas
+ * child). The child-side handler in the owner process decides whether the hwnd has a
+ * client surface to present; posting to surface-less children is a cheap no-op. */
 static int represent_children_walk( struct window *win, const struct rectangle *screen_rect )
 {
     struct window *child;
@@ -3346,11 +3351,8 @@ static int represent_children_walk( struct window *win, const struct rectangle *
         if (!(child->style & WS_VISIBLE)) continue;
         if (!intersect_rect( &intersect, &child->window_rect, screen_rect )) continue;
 
-        if (child->paint_flags & (PAINT_HAS_SURFACE | PAINT_HAS_PIXEL_FORMAT))
-        {
-            post_message( child->handle, WM_WINE_REPRESENT, 0, 0 );
-            found++;
-        }
+        post_message( child->handle, WM_WINE_REPRESENT, 0, 0 );
+        found++;
 
         found += represent_children_walk( child, screen_rect );
     }
@@ -3380,4 +3382,5 @@ DECL_HANDLER(represent_children)
     win->represent_tick = now;
 
     reply->found = represent_children_walk( win, &screen_rect );
+    fprintf( stderr, "W8-DUMP: walk found %d\n", reply->found );
 }
