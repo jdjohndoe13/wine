@@ -86,7 +86,6 @@ struct window
     WCHAR           *text;            /* window caption text */
     data_size_t      text_len;        /* length of window caption */
     unsigned int     paint_flags;     /* various painting flags */
-    unsigned int     represent_tick;  /* last W8 represent_children post (throttle) */
     int              prop_inuse;      /* number of in-use window properties */
     int              prop_alloc;      /* number of allocated window properties */
     struct property *properties;      /* window properties array */
@@ -3397,10 +3396,10 @@ DECL_HANDLER(set_window_layered_info)
  * coords are translated by the set_window_pos request), so the walk must run in screen
  * coords too — the caller maps the request's parent-client rect up first.
  * NOTE: the server has NO knowledge of client surfaces (they are a pure client-side
- * win32u/x11drv mechanism — the creating process never passes a window surface for
- * them, so neither PAINT_HAS_SURFACE nor PAINT_HAS_PIXEL_FORMAT is set on the canvas
- * child). The child-side handler in the owner process decides whether the hwnd has a
- * client surface to present; posting to surface-less children is a cheap no-op. */
+ * win32u/x11drv mechanism — the canvas has no X subwindow and no surface in any
+ * process). The posts are therefore blind: the message is a pure queue wake consumed
+ * by win32u in the child before the app's window proc, and the pump waking is what
+ * makes the child re-composite its content. found = number of wakes posted. */
 static int represent_children_walk( struct window *win, const struct rectangle *screen_rect )
 {
     struct window *child;
@@ -3424,7 +3423,6 @@ DECL_HANDLER(represent_children)
 {
     struct window *win = get_window( req->handle );
     struct rectangle screen_rect;
-    unsigned int now;
 
     if (!win) return;
 
@@ -3432,16 +3430,7 @@ DECL_HANDLER(represent_children)
     screen_rect = req->rect;
     offset_rect( &screen_rect, win->client_rect.left, win->client_rect.top );
 
-    /* server-side dedup: throttle the post per window (>=16 ms); the client side is
-     * already rate-limited at the arm, this is the second gate */
-    now = get_tick_count();
-    if (win->represent_tick && now - win->represent_tick < 16)
-    {
-        reply->found = 0;
-        return;
-    }
-    win->represent_tick = now;
-
+    /* the wake rate is bounded by the client-side arm (>=16 ms per process);
+     * no server-side throttle needed */
     reply->found = represent_children_walk( win, &screen_rect );
-    fprintf( stderr, "W8-DUMP: walk found %d\n", reply->found );
 }
