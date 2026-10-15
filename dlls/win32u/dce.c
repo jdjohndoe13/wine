@@ -657,7 +657,7 @@ void window_surface_flush( struct window_surface *surface )
             /* W8: the flushed content is now on the parent's drawable — if this surface
              * hosts client-surface children (the canvas), they must be re-presented on
              * top; arm the deferred server round-trip (see the W8 comment in window.c) */
-            ws_w8_arm_client_surface( surface->hwnd, &dirty );
+            ws_w8_arm_wake( surface->hwnd, &dirty );
         }
 
         if (ws_probe_big( surface ) && color_info->bmiHeader.biBitCount == 32)
@@ -855,7 +855,7 @@ done:
 
     /* W8: run the deferred represent-children request armed by the flushes above (the
      * server round-trip must not run under surfaces_lock / the user lock) */
-    ws_w8_flush_client_surface_present();
+    ws_w8_flush_wake();
 }
 
 /***********************************************************************
