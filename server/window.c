@@ -86,6 +86,7 @@ struct window
     WCHAR           *text;            /* window caption text */
     data_size_t      text_len;        /* length of window caption */
     unsigned int     paint_flags;     /* various painting flags */
+    unsigned int     represent_tick;  /* last W8 represent_children post (throttle) */
     int              prop_inuse;      /* number of in-use window properties */
     int              prop_alloc;      /* number of allocated window properties */
     struct property *properties;      /* window properties array */
@@ -1358,7 +1359,7 @@ error:
  * CLIPCHILDREN flag; on Wine the child has no X subwindow (it draws straight onto the
  * shared toplevel whole_window), so without this clip the parent's white OnPaint
  * overwrite destroys the child's content. This is the missing sibling of
- * clip_pixel_format_children (below) for the cross-process case.
+ * clip_pixel_format_children (server/window.c:1341) for the cross-process case.
  *
  * Same-process children are NOT clipped here — their parent->child repaint ordering
  * into the shared surface is the existing correct mechanism. The recursion continues
@@ -3387,4 +3388,60 @@ DECL_HANDLER(set_window_layered_info)
         if (!was_layered) redraw_window( win, 0, RDW_ALLCHILDREN | RDW_INVALIDATE | RDW_ERASE | RDW_FRAME, 0 );
     }
     else set_win32_error( ERROR_INVALID_WINDOW_HANDLE );
+}
+
+/* W8: recursive walk posting WM_WINE_REPRESENT to every visible descendant whose
+ * window rect intersects the (screen-coords) dirty rect. The canvas child is
+ * nested under the WebView2 container, so the walk must recurse through plain children.
+ * NOTE: the server stores every window_rect in screen coordinates (the client-side
+ * coords are translated by the set_window_pos request), so the walk must run in screen
+ * coords too — the caller maps the request's parent-client rect up first.
+ * NOTE: the server has NO knowledge of client surfaces (they are a pure client-side
+ * win32u/x11drv mechanism — the creating process never passes a window surface for
+ * them, so neither PAINT_HAS_SURFACE nor PAINT_HAS_PIXEL_FORMAT is set on the canvas
+ * child). The child-side handler in the owner process decides whether the hwnd has a
+ * client surface to present; posting to surface-less children is a cheap no-op. */
+static int represent_children_walk( struct window *win, const struct rectangle *screen_rect )
+{
+    struct window *child;
+    struct rectangle intersect;
+    int found = 0;
+
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+    {
+        if (!(child->style & WS_VISIBLE)) continue;
+        if (!intersect_rect( &intersect, &child->window_rect, screen_rect )) continue;
+
+        post_message( child->handle, WM_WINE_REPRESENT, 0, 0 );
+        found++;
+
+        found += represent_children_walk( child, screen_rect );
+    }
+    return found;
+}
+
+DECL_HANDLER(represent_children)
+{
+    struct window *win = get_window( req->handle );
+    struct rectangle screen_rect;
+    unsigned int now;
+
+    if (!win) return;
+
+    /* map the request rect (handle's client coords) into screen coords */
+    screen_rect = req->rect;
+    offset_rect( &screen_rect, win->client_rect.left, win->client_rect.top );
+
+    /* server-side dedup: throttle the post per window (>=16 ms); the client side is
+     * already rate-limited at the arm, this is the second gate */
+    now = get_tick_count();
+    if (win->represent_tick && now - win->represent_tick < 16)
+    {
+        reply->found = 0;
+        return;
+    }
+    win->represent_tick = now;
+
+    reply->found = represent_children_walk( win, &screen_rect );
+    fprintf( stderr, "W8-DUMP: walk found %d\n", reply->found );
 }
