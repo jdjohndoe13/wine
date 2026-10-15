@@ -651,14 +651,7 @@ void window_surface_flush( struct window_surface *surface )
 
         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
                                    shape_changed, shape_info, shape_bits ))
-        {
             reset_bounds( &surface->bounds );
-
-            /* W8: the flushed content is now on the parent's drawable — if this surface
-             * hosts client-surface children (the canvas), they must be re-presented on
-             * top; arm the deferred server round-trip (see the W8 comment in window.c) */
-            ws_w8_arm_client_surface( surface->hwnd, &dirty );
-        }
 
         if (ws_probe_big( surface ) && color_info->bmiHeader.biBitCount == 32)
         {
@@ -852,10 +845,6 @@ void flush_window_surfaces( BOOL idle )
         window_surface_flush( surface );
 done:
     pthread_mutex_unlock( &surfaces_lock );
-
-    /* W8: run the deferred represent-children request armed by the flushes above (the
-     * server round-trip must not run under surfaces_lock / the user lock) */
-    ws_w8_flush_client_surface_present();
 }
 
 /***********************************************************************
@@ -996,7 +985,7 @@ static void update_visible_region( struct dce *dce )
     /* W6 white-out fix REVERTED (oracle round 6): cross-process wall — the client_surfaces list
      * is per-process; the canvas child's surface lives in the msedge process, the whitening in
      * the Dr.Explain process, so the parent-side exclusion could never see the surface.
-     * Replaced by the W7 child-side present hook (see release_dce / ws_w7_flush below). */
+     * The white-out is fixed server-side in W9 (clip_cross_process_children in server/window.c). */
 
     set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface );
     if (surface) window_surface_release( surface );
@@ -1018,9 +1007,6 @@ static void release_dce( struct dce *dce )
     dce->clip_rgn = 0;
     dce->hwnd     = 0;
     dce->flags   &= DCX_CACHE;
-
-    /* W7 arm removed: the correct predicate is the server-side PAINT_HAS_SURFACE walk,
-     * armed from window_surface_flush (see the W8 comment in window.c) */
 }
 
 /***********************************************************************
@@ -1246,9 +1232,6 @@ void free_dce( struct dce *dce, HWND hwnd, struct list *drawables )
         NtGdiDeleteObjectApp( dce_to_free->hdc );
         free( dce_to_free );
     }
-
-    /* W7 flush removed: the represent-children request now runs from
-     * flush_window_surfaces (see the W8 comment in window.c) */
 }
 
 BOOL is_cache_dc( HDC hdc )
@@ -1377,9 +1360,6 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
         ret = TRUE;
     }
     user_unlock();
-
-    /* W7 flush removed: the represent-children request now runs from
-     * flush_window_surfaces (see the W8 comment in window.c) */
 
     release_opengl_drawables( &drawables );
     return ret;
