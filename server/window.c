@@ -1466,6 +1466,14 @@ static struct region *get_surface_region( struct window *win )
 
     if (!clip_pixel_format_children( win, clip, region, offset_x, offset_y )) goto error;
 
+    /* W11: subtract cross-process children from the surface clip too. The app's
+     * window_surface_flush pushes the surface's bytes (stale white under the canvas,
+     * which is never presented into the surface) via ONE PutImage onto the shared
+     * toplevel drawable; the GC clip derived from this region is the only choke point
+     * that can protect the foreign child's pixels. The W9 clip covers the DC-write
+     * path (get_visible_region) but not this one. */
+    if (!(region = clip_cross_process_children( win, region, offset_x, offset_y ))) goto error;
+
     free_region( clip );
     return region;
 
@@ -2839,6 +2847,17 @@ DECL_HANDLER(set_window_pos)
 
     top = get_top_clipping_window( win );
     if (is_visible( top ) && (top->paint_flags & PAINT_HAS_SURFACE)) reply->surface_win = top->handle;
+
+    /* W11: a cross-process child's geometry/visibility change changes the surface's
+     * hole, but the GC clip is only refreshed from the surface owner's own
+     * set_window_pos path (update_surface_region). The app's client never sees the
+     * canvas move (the foreign process moves it), so notify the surface owner's
+     * thread. The consumer is update_window_state -> apply_window_pos ->
+     * update_surface_region. A same-process set_window_pos (including the refresh's
+     * own) does not re-post, so there is no loop. */
+    if (is_visible( top ) && (top->paint_flags & PAINT_HAS_SURFACE) &&
+        top->thread->process != win->thread->process)
+        post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 }
 
 
