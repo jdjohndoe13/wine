@@ -3346,7 +3346,7 @@ static int represent_children_walk( struct window *win, const struct rectangle *
         if (!(child->style & WS_VISIBLE)) continue;
         if (!intersect_rect( &intersect, &child->window_rect, screen_rect )) continue;
 
-        if (child->paint_flags & PAINT_HAS_SURFACE)
+        if (child->paint_flags & (PAINT_HAS_SURFACE | PAINT_HAS_PIXEL_FORMAT))
         {
             post_message( child->handle, WM_WINE_REPRESENT, 0, 0 );
             found++;
