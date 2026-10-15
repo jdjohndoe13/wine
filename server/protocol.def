@@ -2832,18 +2832,6 @@ enum message_type
 #define SET_WINPOS_PIXEL_FORMAT     0x02  /* window has a custom pixel format */
 #define SET_WINPOS_LAYERED_WINDOW   0x04  /* window is drawn with UpdateLayeredWindow */
 
-/* W8: ask the server to re-present the client-surface children of a window whose
- * content was just overwritten on the parent's drawable (app flush -> server post ->
- * child present). The server walks the window's subtree for PAINT_HAS_SURFACE children
- * intersecting the rect and posts WM_WINE_REPRESENT to each (deduped per window until
- * the child consumes it). */
-@REQ(represent_children)
-    user_handle_t  handle;        /* window whose children should be re-presented */
-    struct rectangle rect;        /* dirty rect (in the handle's client coords) */
-@REPLY
-    int            found;         /* number of children posted (or deduped) */
-@END
-
 /* Get the window and client rectangles of a window */
 @REQ(get_window_rectangles)
     user_handle_t  handle;        /* handle to the window */
