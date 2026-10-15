@@ -3330,20 +3330,21 @@ DECL_HANDLER(set_window_layered_info)
 }
 
 /* W8: recursive walk posting WM_WINE_REPRESENT to PAINT_HAS_SURFACE descendants whose
- * window rect intersects the (parent-client-coords) dirty rect. The canvas child is
- * nested under the WebView2 container, so the walk must recurse through plain children. */
-static int represent_children_walk( struct window *win, const struct rectangle *rect )
+ * window rect intersects the (screen-coords) dirty rect. The canvas child is
+ * nested under the WebView2 container, so the walk must recurse through plain children.
+ * NOTE: the server stores every window_rect in screen coordinates (the client-side
+ * coords are translated by the set_window_pos request), so the walk must run in screen
+ * coords too — the caller maps the request's parent-client rect up first. */
+static int represent_children_walk( struct window *win, const struct rectangle *screen_rect )
 {
     struct window *child;
-    struct rectangle child_rect, intersect;
+    struct rectangle intersect;
     int found = 0;
 
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
     {
         if (!(child->style & WS_VISIBLE)) continue;
-
-        child_rect = child->window_rect;
-        if (!intersect_rect( &intersect, &child_rect, rect )) continue;
+        if (!intersect_rect( &intersect, &child->window_rect, screen_rect )) continue;
 
         if (child->paint_flags & PAINT_HAS_SURFACE)
         {
@@ -3351,10 +3352,7 @@ static int represent_children_walk( struct window *win, const struct rectangle *
             found++;
         }
 
-        /* map the rect into the child's client coords and recurse */
-        child_rect = *rect;
-        offset_rect( &child_rect, -child->client_rect.left, -child->client_rect.top );
-        found += represent_children_walk( child, &child_rect );
+        found += represent_children_walk( child, screen_rect );
     }
     return found;
 }
@@ -3362,9 +3360,14 @@ static int represent_children_walk( struct window *win, const struct rectangle *
 DECL_HANDLER(represent_children)
 {
     struct window *win = get_window( req->handle );
+    struct rectangle screen_rect;
     unsigned int now;
 
     if (!win) return;
+
+    /* map the request rect (handle's client coords) into screen coords */
+    screen_rect = req->rect;
+    offset_rect( &screen_rect, win->client_rect.left, win->client_rect.top );
 
     /* server-side dedup: throttle the post per window (>=16 ms); the client side is
      * already rate-limited at the arm, this is the second gate */
@@ -3376,5 +3379,5 @@ DECL_HANDLER(represent_children)
     }
     win->represent_tick = now;
 
-    reply->found = represent_children_walk( win, &req->rect );
+    reply->found = represent_children_walk( win, &screen_rect );
 }
