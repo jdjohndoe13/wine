@@ -3389,32 +3389,37 @@ DECL_HANDLER(set_window_layered_info)
     else set_win32_error( ERROR_INVALID_WINDOW_HANDLE );
 }
 
-/* W8: recursive walk posting WM_WINE_REPRESENT to every visible descendant whose
- * window rect intersects the (screen-coords) dirty rect. The canvas child is
- * nested under the WebView2 container, so the walk must recurse through plain children.
- * NOTE: the server stores every window_rect in screen coordinates (the client-side
- * coords are translated by the set_window_pos request), so the walk must run in screen
- * coords too — the caller maps the request's parent-client rect up first.
+/* W10: recursive walk posting WM_WINE_REPRESENT to every visible cross-process
+ * descendant of the toplevel — same predicate as the W9 clip
+ * clip_cross_process_children (ptr->thread->process != requesting process).
+ * W10 — wake every visible cross-process descendant of the toplevel; the armed
+ * hwnd's identity/rect no longer gate the walk (the deliverable's flush topology
+ * mis-targeted the canvas with the subtree+intersection design).
  * NOTE: the server has NO knowledge of client surfaces (they are a pure client-side
  * win32u/x11drv mechanism — the canvas has no X subwindow and no surface in any
  * process). The posts are therefore blind: the message is a pure queue wake consumed
  * by win32u in the child before the app's window proc, and the pump waking is what
- * makes the child re-composite its content. found = number of wakes posted. */
-static int represent_children_walk( struct window *win, const struct rectangle *screen_rect )
+ * makes the child re-composite its content. found = number of wakes posted.
+ * Each window is visited at most once per request (tree walk), so each is posted
+ * at most once. */
+static int represent_children_walk( struct window *win, struct process *requesting_process )
 {
     struct window *child;
-    struct rectangle intersect;
     int found = 0;
 
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
     {
         if (!(child->style & WS_VISIBLE)) continue;
-        if (!intersect_rect( &intersect, &child->window_rect, screen_rect )) continue;
 
-        post_message( child->handle, WM_WINE_REPRESENT, 0, 0 );
-        found++;
+        if (child->thread->process != requesting_process)
+        {
+            post_message( child->handle, WM_WINE_REPRESENT, 0, 0 );
+            found++;
+        }
 
-        found += represent_children_walk( child, screen_rect );
+        /* keep descending through both same- and cross-process children; the
+         * canvas can be nested under a cross-process container (the WebView2 case) */
+        found += represent_children_walk( child, requesting_process );
     }
     return found;
 }
@@ -3422,15 +3427,14 @@ static int represent_children_walk( struct window *win, const struct rectangle *
 DECL_HANDLER(represent_children)
 {
     struct window *win = get_window( req->handle );
-    struct rectangle screen_rect;
 
     if (!win) return;
 
-    /* map the request rect (handle's client coords) into screen coords */
-    screen_rect = req->rect;
-    offset_rect( &screen_rect, win->client_rect.left, win->client_rect.top );
+    /* W10: root the walk at the toplevel ancestor; the request's rect stays in the
+     * protocol struct but is no longer used for filtering */
+    while (!is_toplevel( win )) win = win->parent;
 
     /* the wake rate is bounded by the client-side arm (>=16 ms per process);
      * no server-side throttle needed */
-    reply->found = represent_children_walk( win, &screen_rect );
+    reply->found = represent_children_walk( win, current->process );
 }
