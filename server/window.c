@@ -86,6 +86,7 @@ struct window
     WCHAR           *text;            /* window caption text */
     data_size_t      text_len;        /* length of window caption */
     unsigned int     paint_flags;     /* various painting flags */
+    unsigned int     represent_tick;  /* last W8 represent_children post (throttle) */
     int              prop_inuse;      /* number of in-use window properties */
     int              prop_alloc;      /* number of allocated window properties */
     struct property *properties;      /* window properties array */
@@ -3326,4 +3327,54 @@ DECL_HANDLER(set_window_layered_info)
         if (!was_layered) redraw_window( win, 0, RDW_ALLCHILDREN | RDW_INVALIDATE | RDW_ERASE | RDW_FRAME, 0 );
     }
     else set_win32_error( ERROR_INVALID_WINDOW_HANDLE );
+}
+
+/* W8: recursive walk posting WM_WINE_REPRESENT to PAINT_HAS_SURFACE descendants whose
+ * window rect intersects the (parent-client-coords) dirty rect. The canvas child is
+ * nested under the WebView2 container, so the walk must recurse through plain children. */
+static int represent_children_walk( struct window *win, const struct rectangle *rect )
+{
+    struct window *child;
+    struct rectangle child_rect, intersect;
+    int found = 0;
+
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+    {
+        if (!(child->style & WS_VISIBLE)) continue;
+
+        child_rect = child->window_rect;
+        if (!intersect_rect( &intersect, &child_rect, rect )) continue;
+
+        if (child->paint_flags & PAINT_HAS_SURFACE)
+        {
+            post_message( child->handle, WM_WINE_REPRESENT, 0, 0 );
+            found++;
+        }
+
+        /* map the rect into the child's client coords and recurse */
+        child_rect = *rect;
+        offset_rect( &child_rect, -child->client_rect.left, -child->client_rect.top );
+        found += represent_children_walk( child, &child_rect );
+    }
+    return found;
+}
+
+DECL_HANDLER(represent_children)
+{
+    struct window *win = get_window( req->handle );
+    unsigned int now;
+
+    if (!win) return;
+
+    /* server-side dedup: throttle the post per window (>=16 ms); the client side is
+     * already rate-limited at the arm, this is the second gate */
+    now = get_tick_count();
+    if (win->represent_tick && now - win->represent_tick < 16)
+    {
+        reply->found = 0;
+        return;
+    }
+    win->represent_tick = now;
+
+    reply->found = represent_children_walk( win, &req->rect );
 }
