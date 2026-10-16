@@ -158,7 +158,13 @@ static struct scaled_surface *get_scaled_surface( struct window_surface *window_
 static void scaled_surface_set_clip( struct window_surface *window_surface, const RECT *rects, UINT count )
 {
     struct scaled_surface *surface = get_scaled_surface( window_surface );
-    HRGN hrgn = map_dpi_region( window_surface->clip_region, surface->dpi_from, surface->dpi_to );
+    HRGN hrgn;
+
+    /* treex: a scaled surface whose target is itself is degenerate; the caller is
+     * already holding this surface's mutex, so recursing into the target would self-deadlock */
+    if (surface->target_surface == window_surface) return;
+
+    hrgn = map_dpi_region( window_surface->clip_region, surface->dpi_from, surface->dpi_to );
     window_surface_set_clip( surface->target_surface, hrgn );
     if (hrgn) NtGdiDeleteObjectApp( hrgn );
 }
@@ -170,6 +176,12 @@ static BOOL scaled_surface_flush( struct window_surface *window_surface, const R
     struct scaled_surface *surface = get_scaled_surface( window_surface );
     RECT src = *dirty, dst;
     HDC hdc_dst, hdc_src;
+
+    /* treex: a scaled surface whose target is itself is degenerate; the caller already
+     * holds this surface's mutex, so recursing into the target would self-deadlock.
+     * Nothing to blit to — the outer window_surface_flush() resets bounds, so a
+     * successful no-op is the correct terminal state. */
+    if (surface->target_surface == window_surface) return TRUE;
 
     src.left &= ~7;
     src.top &= ~7;
