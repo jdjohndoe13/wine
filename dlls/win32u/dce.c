@@ -586,7 +586,15 @@ struct window_surface *window_surface_create( const struct window_surface_funcs 
         return NULL;
     }
 
-    pthread_mutex_init( &surface->mutex, NULL );
+    /* treex: the surface mutex is re-entrant by design — a GDI op holds it (dibdrv
+     * lock_surface) across a message-driven redraw (WM_PAINT/WM_ERASEBKGND -> a
+     * different DC on the same surface -> lock_surface again) and across
+     * scaled_surface_flush -> target flush. A plain mutex self-deadlocks (owner==self). */
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init( &attr );
+    pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
+    pthread_mutex_init( &surface->mutex, &attr );
+    pthread_mutexattr_destroy( &attr );
 
     memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
 
