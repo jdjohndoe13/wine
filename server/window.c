@@ -2847,17 +2847,6 @@ DECL_HANDLER(set_window_pos)
 
     top = get_top_clipping_window( win );
     if (is_visible( top ) && (top->paint_flags & PAINT_HAS_SURFACE)) reply->surface_win = top->handle;
-
-    /* W11: a cross-process child's geometry/visibility change changes the surface's
-     * hole, but the GC clip is only refreshed from the surface owner's own
-     * set_window_pos path (update_surface_region). The app's client never sees the
-     * canvas move (the foreign process moves it), so notify the surface owner's
-     * thread. The consumer is update_window_state -> apply_window_pos ->
-     * update_surface_region. A same-process set_window_pos (including the refresh's
-     * own) does not re-post, so there is no loop. */
-    if (is_visible( top ) && (top->paint_flags & PAINT_HAS_SURFACE) &&
-        top->thread->process != win->thread->process)
-        post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 }
 
 
