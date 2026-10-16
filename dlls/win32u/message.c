@@ -2263,7 +2263,14 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         return 0;
     }
     case WM_WINE_UPDATEWINDOWSTATE:
-        update_window_state( hwnd );
+        if (user_is_locked()) break;
+        {
+            static DWORD last_update;
+            DWORD now = NtGetTickCount();
+            if (now - last_update < 16) break;   /* idempotent full-state refresh; drop is safe */
+            last_update = now;
+            update_window_state( hwnd );
+        }
         return 0;
     case WM_WINE_SETPIXELFORMAT:
         set_window_pixel_format( hwnd, wparam, lparam );
