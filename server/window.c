@@ -2763,7 +2763,7 @@ DECL_HANDLER(get_window_tree)
 /* set the position and Z order of a window */
 DECL_HANDLER(set_window_pos)
 {
-    struct rectangle window_rect, client_rect, visible_rect, surface_rect, valid_rect, old_window, old_client;
+    struct rectangle window_rect, client_rect, visible_rect, surface_rect, valid_rect, old_window, old_client, old_visible;
     const struct rectangle *extra_rects = get_req_data();
     struct window *previous = NULL;
     struct window *top, *win = get_window( req->handle );
@@ -2834,6 +2834,7 @@ DECL_HANDLER(set_window_pos)
     old_style = win->style;
     old_window = win->window_rect;
     old_client = win->client_rect;
+    old_visible = win->visible_rect;
     set_window_pos( win, previous, flags, &window_rect, &client_rect,
                     &visible_rect, &surface_rect, &valid_rect );
     if ((win->style & old_style & WS_VISIBLE) && (memcmp( &old_client, &win->client_rect, sizeof(old_client) )
@@ -2847,6 +2848,16 @@ DECL_HANDLER(set_window_pos)
 
     top = get_top_clipping_window( win );
     if (is_visible( top ) && (top->paint_flags & PAINT_HAS_SURFACE)) reply->surface_win = top->handle;
+
+    /* W11b: the surface clip's hole depends only on the cross-process child's
+     * visible rect and visibility. Post only when one of those actually changed —
+     * the foreign compositor's z-order-only and no-op set_window_pos churn must
+     * not reach the surface owner (that stream livelocked it). */
+    if (is_visible( top ) && (top->paint_flags & PAINT_HAS_SURFACE) &&
+        top->thread->process != win->thread->process &&
+        (memcmp( &old_visible, &win->visible_rect, sizeof(old_visible) ) ||
+         !!(win->style & WS_VISIBLE) != !!(old_style & WS_VISIBLE)))
+        post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 }
 
 
