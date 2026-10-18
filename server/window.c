@@ -2760,6 +2760,24 @@ DECL_HANDLER(get_window_tree)
 }
 
 
+/* W12: does the window have a visible cross-process descendant? Mirrors the
+ * predicate of the W9 clip clip_cross_process_children(): visible, non-transparent
+ * children; a cross-process child is the hole itself (return found), recursion
+ * continues through same-process children only (the WebView2 nesting case). */
+static int has_cross_process_descendant( struct window *parent, struct process *process )
+{
+    struct window *ptr;
+
+    LIST_FOR_EACH_ENTRY( ptr, &parent->children, struct window, entry )
+    {
+        if (!(ptr->style & WS_VISIBLE)) continue;
+        if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
+        if (ptr->thread->process != process) return 1;
+        if (has_cross_process_descendant( ptr, process )) return 1;
+    }
+    return 0;
+}
+
 /* set the position and Z order of a window */
 DECL_HANDLER(set_window_pos)
 {
@@ -2768,6 +2786,7 @@ DECL_HANDLER(set_window_pos)
     struct window *previous = NULL;
     struct window *top, *win = get_window( req->handle );
     unsigned int flags = req->swp_flags, old_style;
+    int old_effective, cross, rect_diff, eff_diff, post;
 
     if (!win) return;
     if (!win->parent) flags |= SWP_NOZORDER;  /* no Z order for the desktop */
@@ -2835,6 +2854,7 @@ DECL_HANDLER(set_window_pos)
     old_window = win->window_rect;
     old_client = win->client_rect;
     old_visible = win->visible_rect;
+    old_effective = is_visible( win );  /* W12: effective visibility incl. ancestors */
     set_window_pos( win, previous, flags, &window_rect, &client_rect,
                     &visible_rect, &surface_rect, &valid_rect );
     if ((win->style & old_style & WS_VISIBLE) && (memcmp( &old_client, &win->client_rect, sizeof(old_client) )
@@ -2849,15 +2869,30 @@ DECL_HANDLER(set_window_pos)
     top = get_top_clipping_window( win );
     if (is_visible( top ) && (top->paint_flags & PAINT_HAS_SURFACE)) reply->surface_win = top->handle;
 
-    /* W11b: the surface clip's hole depends only on the cross-process child's
-     * visible rect and visibility. Post only when one of those actually changed —
-     * the foreign compositor's z-order-only and no-op set_window_pos churn must
-     * not reach the surface owner (that stream livelocked it). */
-    if (is_visible( top ) && (top->paint_flags & PAINT_HAS_SURFACE) &&
-        top->thread->process != win->thread->process &&
-        (memcmp( &old_visible, &win->visible_rect, sizeof(old_visible) ) ||
-         !!(win->style & WS_VISIBLE) != !!(old_style & WS_VISIBLE)))
-        post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+    /* W12: the surface clip's hole depends on the cross-process descendant's
+     * visible rect and on the effective visibility of the window (a same-process
+     * parent host window hiding/showing also opens/closes the hole for its
+     * cross-process child, e.g. the WebView2 window). Post when either leg
+     * changed:
+     *  (a) win itself is cross-process to the top (the W11b case): rect or
+     *      effective visibility changed, top must still be visible (the child
+     *      needs the hole while it is on screen);
+     *  (b) win is same-process as the top but has a cross-process descendant
+     *      whose hole must be REMOVED when win goes hidden: the effective
+     *      visibility of win changed — note is_visible(top) must NOT be
+     *      required here, the hide-leg post is exactly what unmaps the
+     *      foreign X window when the top is no longer visible. */
+    cross = (top->thread->process != win->thread->process);
+    rect_diff = memcmp( &old_visible, &win->visible_rect, sizeof(old_visible) );
+    eff_diff = is_visible( win ) != old_effective;
+    post = (cross && (top->paint_flags & PAINT_HAS_SURFACE) && is_visible( top ) && (rect_diff || eff_diff)) ||
+           (!cross && (top->paint_flags & PAINT_HAS_SURFACE) && eff_diff &&
+            has_cross_process_descendant( win, win->thread->process ));
+    if (post) post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+    if (eff_diff || rect_diff || post)  /* temporary gate trace, quiet on the churn stream */
+        fprintf( stderr, "DRX-W12 win %x top %x vis_top %d vis_win %d old_eff %d cross %d rect %d post %d\n",
+                 win->handle, top->handle, is_visible( top ), is_visible( win ),
+                 old_effective, cross, rect_diff, post );
 }
 
 
