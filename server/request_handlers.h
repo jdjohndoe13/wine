@@ -164,6 +164,7 @@ DECL_HANDLER(get_class_windows);
 DECL_HANDLER(get_window_children_from_point);
 DECL_HANDLER(get_window_tree);
 DECL_HANDLER(set_window_pos);
+DECL_HANDLER(represent_children);
 DECL_HANDLER(get_window_rectangles);
 DECL_HANDLER(get_window_text);
 DECL_HANDLER(set_window_text);
@@ -476,6 +477,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_get_window_children_from_point,
     (req_handler)req_get_window_tree,
     (req_handler)req_set_window_pos,
+    (req_handler)req_represent_children,
     (req_handler)req_get_window_rectangles,
     (req_handler)req_get_window_text,
     (req_handler)req_set_window_text,
@@ -1594,6 +1596,11 @@ C_ASSERT( offsetof(struct set_window_pos_reply, new_style) == 8 );
 C_ASSERT( offsetof(struct set_window_pos_reply, new_ex_style) == 12 );
 C_ASSERT( offsetof(struct set_window_pos_reply, surface_win) == 16 );
 C_ASSERT( sizeof(struct set_window_pos_reply) == 24 );
+C_ASSERT( offsetof(struct represent_children_request, handle) == 12 );
+C_ASSERT( offsetof(struct represent_children_request, rect) == 16 );
+C_ASSERT( sizeof(struct represent_children_request) == 32 );
+C_ASSERT( offsetof(struct represent_children_reply, found) == 8 );
+C_ASSERT( sizeof(struct represent_children_reply) == 16 );
 C_ASSERT( offsetof(struct get_window_rectangles_request, handle) == 12 );
 C_ASSERT( offsetof(struct get_window_rectangles_request, relative) == 16 );
 C_ASSERT( offsetof(struct get_window_rectangles_request, dpi) == 20 );
