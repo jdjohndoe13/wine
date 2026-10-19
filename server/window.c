@@ -1270,6 +1270,10 @@ static struct region *add_cross_process_descendant_rects( struct window *parent,
  * expose_window, used by expose_window) */
 static int has_cross_process_descendant( struct window *parent, struct process *process );
 
+/* W16: forward declaration of the style-visibility side-effect helper (defined
+ * below the cross-process helpers, used by set_window_info) */
+static void style_visibility_changed( struct window *win, unsigned int old_style, bool old_eff );
+
 /* compute the visible region of a window, in window coordinates */
 static struct region *get_visible_region( struct window *win, unsigned int flags )
 {
@@ -2565,6 +2569,9 @@ DECL_HANDLER(set_window_info)
 {
     struct window *win;
     bool ansi;
+    unsigned int old_style = 0;
+    bool old_eff = false;
+    int vis_flip = 0;
 
     if (!(win = get_window( req->handle ))) return;
     if (is_desktop_window( win ) && win->thread != current)
@@ -2579,6 +2586,9 @@ DECL_HANDLER(set_window_info)
         {
         case GWL_STYLE:
             reply->old_info = win->style;
+            old_style = win->style;
+            old_eff = is_visible( win );
+            vis_flip = ((win->style ^ req->new_info) & WS_VISIBLE) != 0;
             win->style = req->new_info;
             fix_window_ex_style( win );
             /* changing window style triggers a non-client paint */
@@ -2622,6 +2632,12 @@ DECL_HANDLER(set_window_info)
         }
     }
     SHARED_WRITE_END;
+
+    /* W16: the client's parent-invisible fast path (dlls/win32u/window.c
+     * show_window) applies WS_VISIBLE flips here instead of going through
+     * set_window_pos, so the hole-clip and the W12/W13 posts never run.
+     * Re-run the visibility side effects for a WS_VISIBLE flip. */
+    if (vis_flip) style_visibility_changed( win, old_style, old_eff );
 }
 
 
@@ -2892,6 +2908,69 @@ static struct region *add_cross_process_descendant_rects( struct window *parent,
     }
     free_region( tmp );
     return region;
+}
+
+/* W16: the client's parent-invisible fast path (dlls/win32u/window.c
+ * show_window: "if parent is not visible simply toggle WS_VISIBLE and
+ * return") applies WS_VISIBLE flips via set_window_info, which only writes
+ * the style field — the hole-clip recompute, the W12/W13 wake posts and the
+ * W13v4 parent invalidation never run. The toplevel's surface GC-clip then
+ * keeps the (now invisible) cross-process canvas's rect subtracted forever,
+ * the app's own paint of the former canvas area is clipped out of the very
+ * area it must repaint, and the never-presented black X background
+ * (background_pixel = 0) is revealed. Mirror the set_window_pos handler's
+ * visibility side effects here, keyed on the own-style flip (the effective
+ * visibility of these windows is already false — the parent is hidden — so
+ * eff_diff alone is blind to them). */
+static void style_visibility_changed( struct window *win, unsigned int old_style, bool old_eff )
+{
+    struct window *top;
+    struct region *hole;
+    int cross, eff_diff, own_show, own_hide, post;
+
+    if (is_desktop_window( win ) || !win->parent) return;
+    top = get_top_clipping_window( win );
+    cross = (top->thread->process != win->thread->process);
+    eff_diff = is_visible( win ) != old_eff;
+    own_show = !(old_style & WS_VISIBLE) && (win->style & WS_VISIBLE);
+    own_hide = (old_style & WS_VISIBLE) && !(win->style & WS_VISIBLE);
+
+    /* same gate as the set_window_pos handler, rect_diff ≡ 0 here, extended
+     * with the own-style flip legs (the fast path never reaches the
+     * set_window_pos handler, so the W12/W13 posts must run here) */
+    post = (cross && (top->paint_flags & PAINT_HAS_SURFACE) && is_visible( top ) &&
+            (eff_diff || own_show)) ||
+           (!cross && (top->paint_flags & PAINT_HAS_SURFACE) && (eff_diff || own_hide) &&
+            has_cross_process_descendant( win, win->thread->process ));
+    if (post) post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+    if (own_show && cross) post_message( win->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+    if (post) post_to_cross_process_descendants( win, win->thread->process );
+
+    /* W13v4 mirror: the hide of a window that hides a cross-process
+     * descendant — invalidate the former hole on the toplevel so the app's
+     * own window repaints it. The hole is measured from the window's own
+     * client rect (the canvas's visible_rect is still in the server's truth
+     * when the host's own hide arrives first). */
+    if (!is_toplevel( win ) && !is_visible( win ) && own_hide &&
+        has_cross_process_descendant( win, win->thread->process ))
+    {
+        if ((hole = create_empty_region()))
+        {
+            add_cross_process_descendant_rects( win, hole,
+                                                win->client_rect.left - win->window_rect.left,
+                                                win->client_rect.top - win->window_rect.top );
+            if (!is_region_empty( hole ))
+            {
+                fprintf( stderr, "DRX-W16 hide_invalidate %x\n", win->handle );
+                offset_region( hole, win->window_rect.left, win->window_rect.top );
+                redraw_window( win->parent, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
+            }
+            free_region( hole );
+        }
+    }
+    fprintf( stderr, "DRX-W16 style_vis %x top %x vis_top %d vis_win %d old_eff %d cross %d post %d\n",
+             win->handle, top->handle, is_visible( top ), is_visible( win ),
+             old_eff, cross, post );
 }
 
 /* set the position and Z order of a window */
