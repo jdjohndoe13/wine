@@ -2266,6 +2266,7 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
     case WM_WINE_UPDATEWINDOWSTATE:
     {
         static DWORD last_update;
+        WND *win;
         DWORD now;
 
         WARN_(win)( "DRX-W12 received hwnd %p\n", hwnd );
@@ -2296,6 +2297,17 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         last_update = now;
         WARN_(win)( "DRX-W12 post hwnd %p\n", hwnd );
         update_window_state( hwnd );
+        /* W13v3: the host's hide happened in another process and never marked
+         * this window's DCE dirty, so its cached vis-region clip would stay
+         * stale (the full rect). Dirty it now so the next GetDCEx re-fetches
+         * the visible region from the server (which returns empty once the
+         * host is effectively hidden) and the W13v3 empty-clip path in
+         * update_visible_region clips the canvas drawing to nothing. */
+        if ((win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
+        {
+            invalidate_dce( win, NULL );
+            release_win_ptr( win );
+        }
         return 0;
     }
     case WM_WINE_SETPIXELFORMAT:
