@@ -2817,31 +2817,6 @@ static int has_cross_process_descendant( struct window *parent, struct process *
 }
 
 
-/* W15: wake the whole foreign subtree. Once inside the foreign window's own
- * subtree the process reference is meaningless (the render widget shares the
- * canvas's process and is never "cross-process" relative to it), so the
- * generic walk below can never target it. Post to every visible descendant
- * unconditionally: the consumer (WM_WINE_UPDATEWINDOWSTATE ->
- * update_window_state + invalidate_dce, W13v3) is the only per-window
- * mechanism that re-asserts the empty vis-region clip on the render widget's
- * DCE after the host chain hid; the driver gate itself can do nothing for a
- * child without a whole_window (X11DRV_WindowPosChanged returns early on
- * !data->whole_window). Depth is bounded by the server's own tree. */
-static void post_to_foreign_subtree( struct window *parent )
-{
-    struct window *ptr;
-
-    LIST_FOR_EACH_ENTRY( ptr, &parent->children, struct window, entry )
-    {
-        if (!(ptr->style & WS_VISIBLE)) continue;
-        if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
-        fprintf( stderr, "DRX-W15 post_sub %x\n", ptr->handle );
-        post_message( ptr->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
-        post_to_foreign_subtree( ptr );
-    }
-}
-
-
 /* W13v2: post WM_WINE_UPDATEWINDOWSTATE to each visible cross-process descendant
  * of the window itself, not just to the toplevel. The canvas's (the WebView2
  * window's) win32 side never gets a position/visibility message in the msedge
@@ -2867,11 +2842,6 @@ static void post_to_cross_process_descendants( struct window *parent, struct pro
         {
             fprintf( stderr, "DRX-W13 post_child %x\n", ptr->handle );
             post_message( ptr->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
-            /* W15: the render widget (Chrome_RenderWidgetHostHWND) is
-             * same-process as the canvas and unreachable to the walk above;
-             * wake its whole subtree too so the W13v3 clip re-asserts on its
-             * DCE after the host chain hides. */
-            post_to_foreign_subtree( ptr );
             continue;
         }
         post_to_cross_process_descendants( ptr, process );
