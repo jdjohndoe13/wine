@@ -973,7 +973,13 @@ static void update_visible_region( struct dce *dce )
         free( data );
     } while (status == STATUS_BUFFER_OVERFLOW);
 
-    if (status || !vis_rgn) return;
+    if (status) return;
+    if (!vis_rgn) vis_rgn = NtGdiCreateRectRgn( 0, 0, 0, 0 );  /* W13v3: server success with an
+                                                                 * empty region means the window is
+                                                                 * not effectively visible (a cross-
+                                                                 * process host hid) — clip to
+                                                                 * nothing instead of keeping the
+                                                                 * stale full clip */
 
     user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &win_rect, &top_rect, flags );
 
