@@ -1349,6 +1349,20 @@ error:
 }
 
 
+/* W13: minimal rectangle formatter for the DRX-W13 traces (no debugstr in
+ * the server); single-threaded request handling makes the static buffer safe. */
+static const char *rect_str( const struct rectangle *rect )
+{
+    static char buffer[6][32];
+    static int count;
+
+    count = (count + 1) % 6;
+    snprintf( buffer[count], sizeof(buffer[count]), "%d,%d,%d,%d",
+              rect->left, rect->top, rect->right, rect->bottom );
+    return buffer[count];
+}
+
+
 /* clip all cross-process descendants out of the visible region.
  *
  * A child owned by a different process can never share the parent's window surface
@@ -1383,6 +1397,9 @@ static struct region *clip_cross_process_children( struct window *parent, struct
             if (ptr->win_region && !intersect_window_region( tmp, ptr )) break;
             offset_region( tmp, offset_x, offset_y );
             if (!(region = subtract_region( region, region, tmp ))) break;
+            fprintf( stderr, "DRX-W13 hole top=%x child=%x host_vis=%d child_vis=%d rect=%s\n",
+                     parent->handle, ptr->handle, is_visible( parent ), is_visible( ptr ),
+                     rect_str( &ptr->visible_rect ) );
             if (is_region_empty( region )) break;
         }
         else if (!is_region_empty( region ))
@@ -2890,9 +2907,11 @@ DECL_HANDLER(set_window_pos)
             has_cross_process_descendant( win, win->thread->process ));
     if (post) post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
     if (eff_diff || rect_diff || post)  /* temporary gate trace, quiet on the churn stream */
-        fprintf( stderr, "DRX-W12 win %x top %x vis_top %d vis_win %d old_eff %d cross %d rect %d post %d\n",
+        /* W13: own_win = the child's own WS_VISIBLE flag vs vis_win = effective
+         * (is_visible, incl. ancestors) — distinguishes own-flag vs ancestor flips */
+        fprintf( stderr, "DRX-W12 win %x top %x vis_top %d vis_win %d own_win %d old_eff %d cross %d rect %d post %d\n",
                  win->handle, top->handle, is_visible( top ), is_visible( win ),
-                 old_effective, cross, rect_diff, post );
+                 !!(win->style & WS_VISIBLE), old_effective, cross, rect_diff, post );
 }
 
 
