@@ -1580,6 +1580,24 @@ static void set_xembed_flags( struct x11drv_win_data *data, unsigned long flags 
                      x11drv_atom(_XEMBED_INFO), 32, PropModeReplace, (unsigned char*)info, 2 );
 }
 
+/* W13: is this window a child whose parent belongs to another process?
+ * (the WebView2 canvas case: the canvas is reparented under the foreign
+ * host toplevel and its X window lives in the child's own process driver).
+ * Same-process windows and toplevels return FALSE so their behavior is
+ * untouched. Both NtUserGetWindowThread queries are server-backed and
+ * work for foreign windows too. */
+static BOOL is_cross_process_child( HWND hwnd )
+{
+    HWND parent;
+    DWORD own_pid = 0, parent_pid = 0;
+
+    if (!(parent = NtUserGetAncestor( hwnd, GA_PARENT ))) return FALSE;  /* desktop */
+    if (parent == NtUserGetDesktopWindow()) return FALSE;  /* toplevel */
+    if (!NtUserGetWindowThread( hwnd, &own_pid )) return FALSE;
+    if (!NtUserGetWindowThread( parent, &parent_pid )) return FALSE;
+    return own_pid != parent_pid;
+}
+
 static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, BOOL activate )
 {
     UINT old_state = data->pending_state.wm_state;
@@ -1657,6 +1675,24 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
     case MAKELONG(NormalState, IconicState):
         if (!data->embedded) XIconifyWindow( data->display, data->whole_window, data->vis.screen );
         break;
+    }
+
+    /* W13: correlate the map/unmap X calls with the force_unmap decision;
+     * only for cross-process children to avoid log spam. */
+    if (is_cross_process_child( data->hwnd ))
+    {
+        switch (MAKELONG(old_state, new_state))
+        {
+        case MAKELONG(WithdrawnState, IconicState):
+        case MAKELONG(WithdrawnState, NormalState):
+        case MAKELONG(IconicState, NormalState):
+            WARN( "DRX-W13 xmap hwnd=%p state=%d\n", data->hwnd, new_state );
+            break;
+        case MAKELONG(NormalState, WithdrawnState):
+        case MAKELONG(IconicState, WithdrawnState):
+            WARN( "DRX-W13 xunmap hwnd=%p state=%d\n", data->hwnd, new_state );
+            break;
+        }
     }
 
     /* override redirect windows won't receive WM_STATE property changes */
@@ -3374,6 +3410,28 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     {
         release_win_data( data );
         return;
+    }
+
+    /* W13: a reparented cross-process child (the WebView2 canvas) keeps its own
+     * X window under the foreign host toplevel; msedge's async put_IsVisible
+     * race re-shows it with its own WS_VISIBLE flag still set even when the
+     * host (or any ancestor) has been hidden, so it stays mapped and occludes
+     * the app content. When the window is not effectively visible (own flag
+     * AND all ancestors, per the win32u/server NtUserIsWindowVisible), force
+     * the unmap path by clearing the WS_VISIBLE bit we map on. Only applies
+     * to cross-process children; same-process windows and toplevels are
+     * untouched. Placed after the delay heuristics above so it overrides them. */
+    if (is_cross_process_child( hwnd ))
+    {
+        BOOL own_vis = !!(new_style & WS_VISIBLE);
+        BOOL eff_vis = NtUserIsWindowVisible( hwnd );
+
+        if (own_vis && !eff_vis)
+        {
+            WARN( "DRX-W13 force_unmap hwnd=%p whole_window=%lu own_vis=%d eff_vis=%d cross=%d\n",
+                  hwnd, (unsigned long)data->whole_window, own_vis, eff_vis, TRUE );
+            new_style &= ~WS_VISIBLE;
+        }
     }
 
     /* Hack (CW-Bug-Id #26914 parity, Valve 09ab0e2ebcee): withdraw before XReconfigureWMWindow() to avoid a Mutter Wayland _XWAYLAND_ALLOW_COMMITS freeze. */
