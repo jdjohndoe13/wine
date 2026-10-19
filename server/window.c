@@ -1266,6 +1266,10 @@ static struct region *clip_cross_process_children( struct window *parent, struct
 static struct region *add_cross_process_descendant_rects( struct window *parent, struct region *region,
                                                           int offset_x, int offset_y );
 
+/* W13v4: forward declaration of the descendant-hole predicate (defined below
+ * expose_window, used by expose_window) */
+static int has_cross_process_descendant( struct window *parent, struct process *process );
+
 /* compute the visible region of a window, in window coordinates */
 static struct region *get_visible_region( struct window *win, unsigned int flags )
 {
@@ -1970,6 +1974,39 @@ static struct region *expose_window( struct window *win, const struct rectangle 
     int is_composited = is_parent_composited( win );
 
     if (!(new_vis_rgn = get_visible_region( win, DCX_WINDOW ))) return NULL;
+
+    /* W13v4: on hide of a window that hides a cross-process descendant
+     * (the WebView2 canvas hole), both the old and the new visible regions
+     * are empty or hole-free: the old one was computed with the W9 clip
+     * already applied (the hole subtracted from it) and the new one is empty
+     * because the window is hidden. The equal-regions shortcut below and the
+     * is_region_empty( new_vis_rgn ) gate at the bottom therefore both skip
+     * the invalidation, so the parent's update region never contains the
+     * former hole — the app never repaints the former canvas area and the
+     * never-presented black X background (background_pixel = 0) is revealed
+     * when the canvas X window is force-unmapped. Build the hole rect
+     * directly and invalidate the parent with it; the W12 post that removes
+     * the GC-clip hole is an earlier posted message in the owner's queue, so
+     * by the time the lazy WM_PAINT fires the GC clip is open and the paint
+     * lands and gets presented. */
+    if (!is_toplevel( win ) && !(win->style & WS_VISIBLE) &&
+        has_cross_process_descendant( win, win->thread->process ))
+    {
+        struct region *hole = create_empty_region();
+        if (hole)
+        {
+            add_cross_process_descendant_rects( win, hole,
+                                                win->client_rect.left - win->window_rect.left,
+                                                win->client_rect.top - win->window_rect.top );
+            if (!is_region_empty( hole ))
+            {
+                fprintf( stderr, "DRX-W13v4 hide_invalidate %x\n", win->handle );
+                offset_region( hole, old_window_rect->left, old_window_rect->top );
+                redraw_window( win->parent, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
+            }
+            free_region( hole );
+        }
+    }
 
     if (is_composited && !zorder_changed &&
         is_rect_equal( old_window_rect, &win->window_rect ) &&
