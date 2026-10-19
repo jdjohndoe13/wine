@@ -2902,7 +2902,7 @@ DECL_HANDLER(set_window_pos)
     struct window *previous = NULL;
     struct window *top, *win = get_window( req->handle );
     unsigned int flags = req->swp_flags, old_style;
-    int old_effective, cross, rect_diff, eff_diff, post;
+    int old_effective, cross, rect_diff, eff_diff, post, own_show;
 
     if (!win) return;
     if (!win->parent) flags |= SWP_NOZORDER;  /* no Z order for the desktop */
@@ -3001,10 +3001,37 @@ DECL_HANDLER(set_window_pos)
     cross = (top->thread->process != win->thread->process);
     rect_diff = memcmp( &old_visible, &win->visible_rect, sizeof(old_visible) );
     eff_diff = is_visible( win ) != old_effective;
+    /* W15b: the escape event — the window's OWN WS_VISIBLE flips hidden->visible
+     * while it stays effectively hidden (the app-side ancestor chain is hidden).
+     * This is the cross-process re-show (Chromium's async put_IsVisible /
+     * re-parent+re-show under the hidden host): eff_diff is false — effective
+     * visibility does not change — so the W12 gate is blind to it, and the
+     * client's normal path re-maps the window's own X window (the canvas
+     * whole_window: never-presented black background) and X input follows the
+     * mapped window. The server cannot refuse the flag (the app's ShowWindow
+     * return value and the client's own style checks must stay truthful); the
+     * fix is to wake the window's own driver gate at this exact moment. */
+    own_show = !(old_style & WS_VISIBLE) && (win->style & WS_VISIBLE) && !is_visible( win );
     post = (cross && (top->paint_flags & PAINT_HAS_SURFACE) && is_visible( top ) && (rect_diff || eff_diff)) ||
            (!cross && (top->paint_flags & PAINT_HAS_SURFACE) && eff_diff &&
-            has_cross_process_descendant( win, win->thread->process ));
+            has_cross_process_descendant( win, win->thread->process )) ||
+           /* W15b: re-show under an effectively-hidden chain, cross-process to
+            * the top (same-process windows are excluded: their own cascade
+            * already wakes everything). */
+           (own_show && cross);
     if (post) post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+    /* W15b: the re-showing window itself must re-run the driver gate — the
+     * W13v2 walk starts at the changed window and only reaches its
+     * descendants, so neither the top post nor the walk can wake the window
+     * that just escaped. The consumer (update_window_state -> apply_window_pos
+     * -> X11DRV_WindowPosChanged) hits the W13 force_unmap path (own_vis &&
+     * !eff_vis, and NtUserIsWindowVisible is a server round-trip so it reads
+     * the post-cascade truth) and XUnmapWindow's the re-mapped X window. */
+    if (own_show)
+    {
+        fprintf( stderr, "DRX-W15b own_show %x top %x\n", win->handle, top->handle );
+        post_message( win->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+    }
     /* W13v2: the canvas's own thread must see the host hide/show too — its
      * win32 side never gets a position/visibility message in the msedge
      * process, so the W13 driver gate never fires without this post. Both
