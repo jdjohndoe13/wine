@@ -3051,6 +3051,38 @@ DECL_HANDLER(set_window_pos)
         mirror_rect( &win->parent->client_rect, &valid_rect );
     }
 
+    /* W18a: the update_window_state wake (dlls/win32u/window.c, flags
+     * SWP_NOREDRAW|SWP_NOMOVE|SWP_NOSIZE|SWP_NOCLIENTSIZE|SWP_NOCLIENTMOVE|
+     * SWP_NOZORDER|SWP_NOACTIVATE, window rect unchanged) always carries the
+     * client's get_visible_rect() re-derivation as the visible rect. For a
+     * WM-managed maximized toplevel the server's stored visible_rect holds
+     * the WM's raw truth (48px frame), so every wake flips the server's
+     * visible rect by ±48 and the WM ConfigureNotify path flips it back —
+     * a sustained blink/repaint loop (r40: DRX-W12 rect 48 / rect -48
+     * alternating on the toplevel). On a state-only wake (no move, no size,
+     * no frame change, window rect identical) keep the server's old
+     * visible/surface rect instead of the client's re-derivation.
+     * Does not break: (a) legitimate SWP_FRAMECHANGED re-derives — the
+     * client only adds FRAMECHANGED on a surface change and those requests
+     * never carry SWP_NOREDRAW, and the gate excludes it explicitly;
+     * (b) move/resize paths — SWP_NOMOVE|SWP_NOSIZE are required and the
+     * window rect must be unchanged; (c) non-managed windows — the gate is
+     * toplevel-only and for undecorated/non-managed toplevels the client's
+     * derived visible rect equals the server's stored one, so the memcmp
+     * below is false and the path is a no-op. */
+    if (is_toplevel( win ) && !memcmp( &window_rect, &win->window_rect, sizeof(window_rect) ) &&
+        (req->swp_flags & (SWP_NOREDRAW | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED)) ==
+            (SWP_NOREDRAW | SWP_NOMOVE | SWP_NOSIZE))
+    {
+        if (memcmp( &visible_rect, &win->visible_rect, sizeof(visible_rect) ))
+        {
+            fprintf( stderr, "DRX-W18 vis_suppressed win %x flags %x\n", win->handle, req->swp_flags );
+            visible_rect = win->visible_rect;
+            if (get_req_data_size() >= 2 * sizeof(struct rectangle)) surface_rect = win->surface_rect;
+            else surface_rect = visible_rect;
+        }
+    }
+
     win->paint_flags = (win->paint_flags & ~PAINT_CLIENT_FLAGS) | (req->paint_flags & PAINT_CLIENT_FLAGS);
     if (win->paint_flags & PAINT_HAS_PIXEL_FORMAT) update_pixel_format_flags( win );
 
@@ -3088,6 +3120,11 @@ DECL_HANDLER(set_window_pos)
      *      foreign X window when the top is no longer visible. */
     cross = (top->thread->process != win->thread->process);
     rect_diff = memcmp( &old_visible, &win->visible_rect, sizeof(old_visible) );
+    /* W18: the ±48 oscillation probe — fires on every stored visible_rect flip
+     * of the toplevel itself (the DRX-W12 "rect" column restricted to the
+     * toplevel); zero rows after the W18a gate means the loop is gone. */
+    if (rect_diff && is_toplevel( win ))
+        fprintf( stderr, "DRX-W18 vis_flip win %x diff %d flags %x\n", win->handle, rect_diff, req->swp_flags );
     eff_diff = is_visible( win ) != old_effective;
     /* W15b: the escape event — the window's OWN WS_VISIBLE flips hidden->visible
      * while it stays effectively hidden (the app-side ancestor chain is hidden).
