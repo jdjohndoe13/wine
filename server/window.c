@@ -2962,6 +2962,15 @@ static void style_visibility_changed( struct window *win, unsigned int old_style
             if (!is_region_empty( hole ))
             {
                 fprintf( stderr, "DRX-W16 hide_invalidate %x\n", win->handle );
+                /* W17: wake the toplevel's client so update_surface_region()
+                 * removes the stale GC-clip hole before the redraw below
+                 * repaints through the restored clip (queued first, so the
+                 * post runs ahead of the lazy WM_PAINT). */
+                if (top->paint_flags & PAINT_HAS_SURFACE)
+                {
+                    fprintf( stderr, "DRX-W17 hole_wake %x top %x\n", win->handle, top->handle );
+                    post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+                }
                 offset_region( hole, win->window_rect.left, win->window_rect.top );
                 redraw_window( win->parent, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
             }
