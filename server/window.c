@@ -2977,6 +2977,27 @@ static void style_visibility_changed( struct window *win, unsigned int old_style
             free_region( hole );
         }
     }
+
+    /* W19: the canvas's OWN hide (cross-process, fast path) is the event that
+     * actually closes the hole (its WS_VISIBLE is now clear). Wake the
+     * surface owner and re-invalidate the former hole — the host-side W17
+     * wake fires too early (async msedge hide) and re-reads the hole. */
+    if (cross && own_hide && !is_visible( win ) &&
+        (top->paint_flags & PAINT_HAS_SURFACE) && is_visible( top ))
+    {
+        if ((hole = create_empty_region()))
+        {
+            set_region_rect( hole, &win->visible_rect );
+            if (win->win_region) intersect_window_region( hole, win );
+            offset_region( hole, win->window_rect.left, win->window_rect.top );
+            fprintf( stderr, "DRX-W19 canvas_hide_wake %x top %x hole %s\n",
+                     win->handle, top->handle, rect_str( &win->visible_rect ) );
+            post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+            redraw_window( win->parent, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
+        }
+        free_region( hole );
+    }
+
     fprintf( stderr, "DRX-W16 style_vis %x top %x vis_top %d vis_win %d old_eff %d cross %d post %d\n",
              win->handle, top->handle, is_visible( top ), is_visible( win ),
              old_eff, cross, post );
