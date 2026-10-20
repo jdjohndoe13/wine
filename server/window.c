@@ -3051,45 +3051,6 @@ DECL_HANDLER(set_window_pos)
         mirror_rect( &win->parent->client_rect, &valid_rect );
     }
 
-    /* W18a: the update_window_state wake (dlls/win32u/window.c, flags
-     * SWP_NOREDRAW|SWP_NOMOVE|SWP_NOSIZE|SWP_NOCLIENTSIZE|SWP_NOCLIENTMOVE|
-     * SWP_NOZORDER|SWP_NOACTIVATE, window rect unchanged) always carries the
-     * client's get_visible_rect() re-derivation as the visible rect. For a
-     * WM-managed maximized toplevel the server's stored visible_rect holds
-     * the WM's raw truth (48px frame), so every wake flips the server's
-     * visible rect by ±48 and the WM ConfigureNotify path flips it back —
-     * a sustained blink/repaint loop (r40: DRX-W12 rect 48 / rect -48
-     * alternating on the toplevel). On a state-only wake (no move, no size,
-     * no frame change, window rect identical) keep the server's old
-     * visible/surface rect instead of the client's re-derivation.
-     * Does not break: (a) legitimate SWP_FRAMECHANGED re-derives — the
-     * client only adds FRAMECHANGED on a surface change and those requests
-     * never carry SWP_NOREDRAW, and the gate excludes it explicitly;
-     * (b) move/resize paths — SWP_NOMOVE|SWP_NOSIZE are required and the
-     * window rect must be unchanged; (c) non-managed windows — the gate is
-     * toplevel-only and for undecorated/non-managed toplevels the client's
-     * derived visible rect equals the server's stored one, so the memcmp
-     * below is false and the path is a no-op. */
-    if (is_toplevel( win ) && !memcmp( &window_rect, &win->window_rect, sizeof(window_rect) ) &&
-        (req->swp_flags & (SWP_NOREDRAW | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED)) ==
-            (SWP_NOREDRAW | SWP_NOMOVE | SWP_NOSIZE))
-    {
-        if (memcmp( &visible_rect, &win->visible_rect, sizeof(visible_rect) ))
-        {
-            /* W19 probe: the W18a freeze actually fired — server kept its stored
-             * visible rect vs the client's re-derived push. Pair with the
-             * client's DRX-W19 ccommit row (dlls/win32u/window.c): one server
-             * row per client row means the two gates agree; a missing row means
-             * the predicates diverged. */
-            fprintf( stderr, "DRX-W19 freeze %x keep %s want %s\n", win->handle,
-                     rect_str( &win->visible_rect ), rect_str( &visible_rect ) );
-            fprintf( stderr, "DRX-W18 vis_suppressed win %x flags %x\n", win->handle, req->swp_flags );
-            visible_rect = win->visible_rect;
-            if (get_req_data_size() >= 2 * sizeof(struct rectangle)) surface_rect = win->surface_rect;
-            else surface_rect = visible_rect;
-        }
-    }
-
     win->paint_flags = (win->paint_flags & ~PAINT_CLIENT_FLAGS) | (req->paint_flags & PAINT_CLIENT_FLAGS);
     if (win->paint_flags & PAINT_HAS_PIXEL_FORMAT) update_pixel_format_flags( win );
 

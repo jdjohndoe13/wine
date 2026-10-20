@@ -2525,32 +2525,8 @@ static void update_surface_region( HWND hwnd )
         NtGdiOffsetRgn( region, -visible.left, -visible.top );
         if (shape) NtGdiCombineRgn( region, region, shape, RGN_AND );
         window_surface_set_clip( win->surface, region );
+        NtGdiDeleteObjectApp( region );
     }
-
-    /* W19 probe: the clip just installed on the surface (the canvas-hole
-     * geometry): the surface owner, the visible rect the clip is expressed
-     * in and the rectangle count of the installed clip (region, or shape
-     * when there is no clip region). Ungated WARN (win32u is
-     * -nodefaultlibs and cannot link fprintf/stderr). */
-    {
-        HRGN clip = region ? region : shape;
-        DWORD nrects = 0;
-
-        if (clip)
-        {
-            DWORD size = NtGdiGetRegionData( clip, 0, NULL );
-            if (size)
-            {
-                RGNDATA *data = malloc( size );
-                if (data && NtGdiGetRegionData( clip, size, data ))
-                    nrects = data->rdh.nCount;
-                free( data );
-            }
-        }
-        WARN( "DRX-W19 surfclip %p vis %s nrects %u\n", hwnd, wine_dbgstr_rect( &visible ), nrects );
-    }
-
-    if (region) NtGdiDeleteObjectApp( region );
 
 done:
     if (shape) NtGdiDeleteObjectApp( shape );
@@ -2801,12 +2777,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
         if ((ret = !wine_server_call( req )))
         {
-            RECT old_visible = win->rects.visible;
-            RECT old_window = win->rects.window;
-
             win->dwStyle      = reply->new_style;
             win->dwExStyle    = reply->new_ex_style;
-
             win->rects        = *new_rects;
             if ((win->surface = new_surface)) window_surface_add_ref( win->surface );
             surface_win       = wine_server_ptr_handle( reply->surface_win );
@@ -2817,45 +2789,6 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
                 mirror_rect( &client, &win->rects.window );
                 mirror_rect( &client, &win->rects.client );
                 mirror_rect( &client, &win->rects.visible );
-            }
-
-            /* W18b: mirror the W18a server-side visible-rect freeze (server/
-             * window.c, DECL_HANDLER(set_window_pos)) on the client side. The
-             * server keeps its stored visible/surface rect on a state-only
-             * toplevel wake (NOREDRAW|NOMOVE|NOSIZE set, FRAMECHANGED clear,
-             * window rect unchanged); if the client still committed its own
-             * get_visible_rect() re-derivation here, the two sides diverge by
-             * the decoration offset and update_surface_region() mis-applies
-             * the clip, so the canvas hole is never actually removed. Keep the
-             * client's old visible rect under the same predicate: toplevel
-             * (client-side is_toplevel: !win->parent || is_desktop_window(
-             * win->parent) — the same no-server-call check used elsewhere in
-             * this file; get_desktop_window() would issue a nested server
-             * request here), window rect unchanged between the old stored
-             * win->rects and new_rects (EqualRect is a bijection-preserving
-             * comparison, so it matches the server's memcmp on the
-             * driver-mirrored values the same way), and the flags as sent to
-             * the server (req->swp_flags == local swp_flags at the call).
-             * Placed after the RTL mirror block: the old visible is already
-             * stored mirrored, so restoring it before the block would
-             * double-mirror it. The struct window_rects has no surface
-             * member (only window/client/visible), so the visible rect is
-             * the only thing to restore. */
-            if ((!win->parent || is_desktop_window( win->parent )) &&
-                EqualRect( &old_window, &win->rects.window ) &&
-                ((swp_flags & (SWP_NOREDRAW | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED)) ==
-                    (SWP_NOREDRAW | SWP_NOMOVE | SWP_NOSIZE)))
-            {
-                if (!EqualRect( &old_visible, &win->rects.visible ))
-                {
-                    /* W19: ungated probe (WARN routes to the console like the
-                     * server's fprintf; win32u is -nodefaultlibs and cannot
-                     * link fprintf/stderr). Fires only when the client-side
-                     * mirror commit actually freezes the visible rect. */
-                    WARN( "DRX-W19 ccommit %p oldvis %s newvis %s\n", hwnd,
-                          wine_dbgstr_rect( &old_visible ), wine_dbgstr_rect( &win->rects.visible ) );
-                    win->rects.visible = old_visible;
-                }
             }
             /* if an RTL window is resized the children have moved */
             if (win->dwExStyle & WS_EX_LAYOUTRTL &&
