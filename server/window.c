@@ -2910,6 +2910,27 @@ static struct region *add_cross_process_descendant_rects( struct window *parent,
     return region;
 }
 
+/* W20: map a region from the client coordinates of the ancestor 'cur' into the
+ * client coordinates of the toplevel 'top' (a strict ancestor of cur, or cur
+ * itself). Accumulate the client origins of every ancestor from cur up to but
+ * not including top: client_rect is by definition in the parent's client
+ * system, so each step is a pure += client_rect.left/top (the same walk as
+ * client_to_screen_rect() and get_window_visible_rect()). The window_rect
+ * two-step of validate_parents() is NOT needed here: that walk converts between
+ * two window-coord systems (update regions are window-relative), while the hole
+ * and the redraw_window() input are both client-coord systems. */
+static void map_region_to_top_client( struct region *region, struct window *cur, struct window *top )
+{
+    int offset_x = 0, offset_y = 0;
+
+    for ( ; cur && cur != top; cur = cur->parent )
+    {
+        offset_x += cur->client_rect.left;
+        offset_y += cur->client_rect.top;
+    }
+    offset_region( region, offset_x, offset_y );
+}
+
 /* W16: the client's parent-invisible fast path (dlls/win32u/window.c
  * show_window: "if parent is not visible simply toggle WS_VISIBLE and
  * return") applies WS_VISIBLE flips via set_window_info, which only writes
@@ -2971,8 +2992,23 @@ static void style_visibility_changed( struct window *win, unsigned int old_style
                     fprintf( stderr, "DRX-W17 hole_wake %x top %x\n", win->handle, top->handle );
                     post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
                 }
+                /* W16 hole is in win's window coords (client-origin seed in
+                 * add_cross_process_descendant_rects()); + window_rect puts it
+                 * into win->parent's client coords. */
                 offset_region( hole, win->window_rect.left, win->window_rect.top );
-                redraw_window( win->parent, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
+                /* W20: the host hid via the parent-invisible fast path, so
+                 * win->parent is itself hidden — a hidden window never gets
+                 * WM_PAINT and update regions never propagate upward
+                 * (validate_parents only clips, never creates). Invalidate the
+                 * visible toplevel instead; the redraw_window() cascade
+                 * (WS_VISIBLE-only) reaches the editor under it. */
+                if (top->paint_flags & PAINT_HAS_SURFACE)
+                {
+                    fprintf( stderr, "DRX-W20 hide_invalidate_top %x top %x\n",
+                             win->handle, top->handle );
+                    map_region_to_top_client( hole, win->parent, top );
+                    redraw_window( top, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
+                }
             }
             free_region( hole );
         }
@@ -2989,11 +3025,18 @@ static void style_visibility_changed( struct window *win, unsigned int old_style
         {
             set_region_rect( hole, &win->visible_rect );
             if (win->win_region) intersect_window_region( hole, win );
-            offset_region( hole, win->window_rect.left, win->window_rect.top );
             fprintf( stderr, "DRX-W19 canvas_hide_wake %x top %x hole %s\n",
                      win->handle, top->handle, rect_str( &win->visible_rect ) );
             post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
-            redraw_window( win->parent, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
+            /* W20: the visible_rect is already in win->parent's client coords
+             * (the old +window_rect offset double-added the origin — masked by
+             * the frameless canvas's ~0 window origin). The canvas's own hide
+             * arrives via the fast path while the host chain is hidden, so the
+             * old win->parent target never painted; retarget the toplevel. */
+            fprintf( stderr, "DRX-W20 canvas_hide_invalidate_top %x top %x hole %s\n",
+                     win->handle, top->handle, rect_str( &win->visible_rect ) );
+            map_region_to_top_client( hole, win->parent, top );
+            redraw_window( top, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
         }
         free_region( hole );
     }
