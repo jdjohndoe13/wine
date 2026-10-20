@@ -3860,7 +3860,7 @@ TREEVIEW_HitTest(const TREEVIEW_INFO *infoPtr, LPTVHITTESTINFO lpht)
     {
 	lpht->flags = TVHT_ONITEMSTATEICON;
     }
-    else if (x >= item->linesOffset && infoPtr->dwStyle & TVS_HASBUTTONS)
+    else if (x >= item->linesOffset && (infoPtr->dwStyle & TVS_HASBUTTONS) && item->cChildren)
     {
 	lpht->flags = TVHT_ONITEMBUTTON;
     }
