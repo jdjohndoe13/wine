@@ -3076,6 +3076,13 @@ DECL_HANDLER(set_window_pos)
     {
         if (memcmp( &visible_rect, &win->visible_rect, sizeof(visible_rect) ))
         {
+            /* W19 probe: the W18a freeze actually fired — server kept its stored
+             * visible rect vs the client's re-derived push. Pair with the
+             * client's DRX-W19 ccommit row (dlls/win32u/window.c): one server
+             * row per client row means the two gates agree; a missing row means
+             * the predicates diverged. */
+            fprintf( stderr, "DRX-W19 freeze %x keep %s want %s\n", win->handle,
+                     rect_str( &win->visible_rect ), rect_str( &visible_rect ) );
             fprintf( stderr, "DRX-W18 vis_suppressed win %x flags %x\n", win->handle, req->swp_flags );
             visible_rect = win->visible_rect;
             if (get_req_data_size() >= 2 * sizeof(struct rectangle)) surface_rect = win->surface_rect;
