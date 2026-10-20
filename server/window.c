@@ -1747,18 +1747,42 @@ static void validate_parents( struct window *child )
 }
 
 
+/* W20B: one-shot cascade tracer. Armed by the W16/W19 canvas-hide block right
+ * before the redraw_window() call so the trace covers only the toplevel cascade
+ * that follows a canvas hide (the repaint that must reach the editor), not every
+ * repaint in the session. Disarmed when the outermost (nested == 0) call returns. */
+static int drx_w20b_armed;
+
+static void drx_w20b_trace( const char *where, struct window *win, struct region *region )
+{
+    struct rectangle bbox = { 0, 0, 0, 0 };
+    if (!drx_w20b_armed) return;
+    if (region) get_region_extents( region, &bbox );
+    fprintf( stderr, "DRX-W20B %s win %x vis %d clip %d wrect %s rgn %s\n",
+             where, win->handle, !!(win->style & WS_VISIBLE),
+             !!(win->style & WS_CLIPCHILDREN),
+             rect_str( &win->window_rect ), rect_str( &bbox ) );
+}
+
+static void drx_w20b_leave( int nested )
+{
+    if (!nested) drx_w20b_armed = 0;
+}
+
 /* add/subtract a region (in client coordinates) to the update region of the window */
 static void redraw_window( struct window *win, struct region *region, unsigned int flags, int nested )
 {
     struct region *child_rgn, *tmp;
     struct window *child;
 
+    drx_w20b_trace( "enter", win, region );
+
     if (flags & RDW_INVALIDATE)
     {
         const int frame = !!(flags & RDW_FRAME);
-        if (!(tmp = crop_region_to_win_rect( win, region, frame ))) return;
+        if (!(tmp = crop_region_to_win_rect( win, region, frame ))) { drx_w20b_trace( "crop-null", win, region ); drx_w20b_leave( nested ); return; }
 
-        if (!add_update_region( win, tmp )) return;
+        if (!add_update_region( win, tmp )) { drx_w20b_trace( "addfail", win, region ); drx_w20b_leave( nested ); return; }
 
         if (flags & RDW_FRAME) win->paint_flags |= PAINT_NONCLIENT;
         if (flags & RDW_ERASE) win->paint_flags |= PAINT_ERASE;
@@ -1799,21 +1823,26 @@ static void redraw_window( struct window *win, struct region *region, unsigned i
 
     /* now process children recursively */
 
-    if (flags & RDW_NOCHILDREN) return;
-    if (win->style & WS_MINIMIZE) return;
-    if ((win->style & WS_CLIPCHILDREN) && !(flags & RDW_ALLCHILDREN)) return;
+    if (flags & RDW_NOCHILDREN) { drx_w20b_leave( nested ); return; }
+    if (win->style & WS_MINIMIZE) { drx_w20b_trace( "minimized", win, region ); drx_w20b_leave( nested ); return; }
+    if ((win->style & WS_CLIPCHILDREN) && !(flags & RDW_ALLCHILDREN)) { drx_w20b_trace( "clip-noall", win, region ); drx_w20b_leave( nested ); return; }
 
-    if (!(tmp = crop_region_to_win_rect( win, region, 0 ))) return;
+    if (!(tmp = crop_region_to_win_rect( win, region, 0 ))) { drx_w20b_trace( "crop2-null", win, region ); drx_w20b_leave( nested ); return; }
 
     /* map to client coordinates */
     offset_region( tmp, win->window_rect.left - win->client_rect.left,
                    win->window_rect.top - win->client_rect.top );
+    drx_w20b_trace( "walk", win, tmp );
 
     if (flags & RDW_INVALIDATE) flags |= RDW_FRAME | RDW_ERASE;
 
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
     {
-        if (!(child->style & WS_VISIBLE)) continue;
+        if (!(child->style & WS_VISIBLE))
+        {
+            drx_w20b_trace( "skip-hidden", child, tmp );
+            continue;
+        }
         if (!(child_rgn = create_empty_region())) continue;
         if (copy_region( child_rgn, tmp ))
         {
@@ -1823,11 +1852,13 @@ static void redraw_window( struct window *win, struct region *region, unsigned i
                 offset_region( child_rgn, -child->client_rect.left, -child->client_rect.top );
                 redraw_window( child, child_rgn, flags, 1 );
             }
+            else drx_w20b_trace( "no-hit", child, child_rgn );
         }
         free_region( child_rgn );
     }
 
     free_region( tmp );
+    drx_w20b_leave( nested );
 }
 
 
@@ -3007,6 +3038,7 @@ static void style_visibility_changed( struct window *win, unsigned int old_style
                     fprintf( stderr, "DRX-W20 hide_invalidate_top %x top %x\n",
                              win->handle, top->handle );
                     map_region_to_top_client( hole, win->parent, top );
+                    drx_w20b_armed = 1;
                     redraw_window( top, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
                 }
             }
@@ -3036,6 +3068,7 @@ static void style_visibility_changed( struct window *win, unsigned int old_style
             fprintf( stderr, "DRX-W20 canvas_hide_invalidate_top %x top %x hole %s\n",
                      win->handle, top->handle, rect_str( &win->visible_rect ) );
             map_region_to_top_client( hole, win->parent, top );
+            drx_w20b_armed = 1;
             redraw_window( top, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
         }
         free_region( hole );
