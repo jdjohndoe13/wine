@@ -3055,6 +3055,9 @@ static void style_visibility_changed( struct window *win, unsigned int old_style
     {
         if ((hole = create_empty_region()))
         {
+            struct rectangle mapped;
+            int fb = 0;
+
             set_region_rect( hole, &win->visible_rect );
             if (win->win_region) intersect_window_region( hole, win );
             fprintf( stderr, "DRX-W19 canvas_hide_wake %x top %x hole %s\n",
@@ -3068,6 +3071,24 @@ static void style_visibility_changed( struct window *win, unsigned int old_style
             fprintf( stderr, "DRX-W20 canvas_hide_invalidate_top %x top %x hole %s\n",
                      win->handle, top->handle, rect_str( &win->visible_rect ) );
             map_region_to_top_client( hole, win->parent, top );
+            /* W25: when the canvas was reparented to a parking window before
+             * hiding (NtUserSetParent), win->parent is no longer an ancestor
+             * of the toplevel, so the mapped hole lands outside it (e.g.
+             * mapped (1338,110)-(2396,878) vs toplevel client (63,161,1332,759)).
+             * The redraw_window( top, hole ) below is then cropped to NULL —
+             * zero invalidation — and the editor under the former canvas area
+             * never repaints (stale HTML frame). If the mapped hole is empty
+             * or misses the toplevel's client rect (the mapped region and
+             * top->client_rect are both in the toplevel's client coord system),
+             * fall back to invalidating the whole toplevel client rect. */
+            get_region_extents( hole, &mapped );
+            if (is_region_empty( hole ) || !rect_in_region( hole, &top->client_rect ))
+            {
+                set_region_rect( hole, &top->client_rect );
+                fb = 1;
+            }
+            fprintf( stderr, "DRX-W25 w19_fallback %x parent %x mapped %s fb %d\n",
+                     win->handle, win->parent->handle, rect_str( &mapped ), fb );
             drx_w20b_armed = 1;
             redraw_window( top, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
         }
