@@ -7489,7 +7489,7 @@ static void test_HitTestTextRange_extra(void)
     IDWriteFactory_Release(factory);
 }
 
-static void test_HitTestPoint(void)
+static void test_HitTestPoint_fork(void)
 {
     DWRITE_CLUSTER_METRICS cluster_metrics[8];
     DWRITE_LINE_METRICS line_metrics[2];
@@ -8539,7 +8539,7 @@ START_TEST(layout)
     test_layout_range_length();
     test_HitTestTextRange();
     test_HitTestTextRange_extra();
-    test_HitTestPoint();
+    test_HitTestPoint_fork();
     test_HitTestTextPosition();
     test_HitTestPoint();
     test_HitTestTextPosition_empty_layout();
