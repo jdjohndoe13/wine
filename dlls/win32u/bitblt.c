@@ -34,6 +34,7 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(bitblt);
+WINE_DECLARE_DEBUG_CHANNEL(win); /* DRX-W44B */
 
 static inline BOOL rop_uses_src( DWORD rop )
 {
@@ -581,6 +582,39 @@ BOOL WINAPI NtGdiBitBlt( HDC hdc_dst, INT x_dst, INT y_dst, INT width, INT heigh
 }
 
 
+/* DRX-W44B: probe-only - log the selected bitmap's surface byte range for a DC
+ * so a DRX-W44 fault address can be compared against it. No logic change. */
+static void w44_log_surface( const char *tag, HDC hdc, const DC *dc )
+{
+    BITMAPOBJ *bmp;
+
+    if (!hdc)
+    {
+        WARN_(win)( "DRX-W44B %s=(null)\n", tag );
+        return;
+    }
+    if (!dc)
+    {
+        WARN_(win)( "DRX-W44B %s hdc=%p no-dc\n", tag, hdc );
+        return;
+    }
+    if ((bmp = GDI_GetObjPtr( dc->hBitmap, NTGDI_OBJ_BITMAP )))
+    {
+        BYTE *bits = bmp->dib.dsBm.bmBits;
+        INT w = bmp->dib.dsBmih.biWidth;
+        INT h = bmp->dib.dsBmih.biHeight;
+        UINT bpp = bmp->dib.dsBmih.biBitCount;
+        SIZE_T stride = ((SIZE_T)(w < 0 ? -w : w) * bpp + 31) / 32 * 4;
+        SIZE_T size = stride * (SIZE_T)(h < 0 ? -h : h);
+        WARN_(win)( "DRX-W44B %s hdc=%p bmp=%p bits=%p bpp=%u %dx%d stride=%u sizeimg=%u range=%p-%p\n",
+                    tag, hdc, dc->hBitmap, bits, bpp, w, h,
+                    (unsigned int)stride, (unsigned int)bmp->dib.dsBmih.biSizeImage,
+                    bits, bits ? bits + size : NULL );
+        GDI_ReleaseObj( dc->hBitmap );
+    }
+    else WARN_(win)( "DRX-W44B %s hdc=%p bmp=%p not-a-bitmap\n", tag, hdc, dc->hBitmap );
+}
+
 /***********************************************************************
  *           NtGdiStretchBlt    (win32u.@)
  */
@@ -626,6 +660,16 @@ BOOL WINAPI NtGdiStretchBlt( HDC hdcDst, INT xDst, INT yDst, INT widthDst, INT h
               hdcDst, dst.log_x, dst.log_y, dst.log_width, dst.log_height,
               dst.x, dst.y, dst.width, dst.height, wine_dbgstr_rect(&dst.visrect), rop );
 
+        /* DRX-W44B: rect + surface byte ranges for both DCs so a DRX-W44
+         * fault address can be compared against the src surface range. */
+        WARN_(win)( "DRX-W44B dst=%p log=%d,%d %dx%d phys=%d,%d %dx%d src=%p log=%d,%d %dx%d phys=%d,%d %dx%d rop=%06x\n",
+                    hdcDst, dst.log_x, dst.log_y, dst.log_width, dst.log_height,
+                    dst.x, dst.y, dst.width, dst.height,
+                    hdcSrc, src.log_x, src.log_y, src.log_width, src.log_height,
+                    src.x, src.y, src.width, src.height, rop );
+        w44_log_surface( "dst", hdcDst, dcDst );
+        w44_log_surface( "src", hdcSrc, dcSrc );
+
         if (!ret)
         {
             PHYSDEV src_dev = GET_DC_PHYSDEV( dcSrc, pStretchBlt );
@@ -633,6 +677,14 @@ BOOL WINAPI NtGdiStretchBlt( HDC hdcDst, INT xDst, INT yDst, INT widthDst, INT h
             ret = dst_dev->funcs->pStretchBlt( dst_dev, &dst, src_dev, &src, rop );
         }
         release_dc_ptr( dcSrc );
+    }
+    else
+    {
+        /* DRX-W44B: src DC is gone (e.g. Solid BRUSHNOTAVAILABLE) - still
+         * log the dst surface so the fault can be attributed to it. */
+        WARN_(win)( "DRX-W44B src=(null) hdcSrc=%p dst=%p log=%d,%d %dx%d\n",
+                    hdcSrc, hdcDst, xDst, yDst, widthDst, heightDst );
+        w44_log_surface( "dst", hdcDst, dcDst );
     }
     release_dc_ptr( dcDst );
     return ret;
