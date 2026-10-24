@@ -86,6 +86,7 @@ extern void _thread_set_tsd_base(uint64_t);
 
 WINE_DEFAULT_DEBUG_CHANNEL(unwind);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
+WINE_DECLARE_DEBUG_CHANNEL(win); /* DRX-W44 */
 
 #include "dwarf.h"
 
@@ -2104,6 +2105,12 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigconte
 
     if (data->jmp_buf)
     {
+        /* DRX-W44 jmp: unixlib __TRY case, AV short-circuited to the unixlib handler. */
+        if (rec->ExceptionCode == 0xc0000005 /* STATUS_ACCESS_VIOLATION */)
+            WARN_(win)( "DRX-W44 jmp code=%08x addr=%p rw=%lu fault=%p\n",
+                        rec->ExceptionCode, rec->ExceptionAddress,
+                        (unsigned long)rec->ExceptionInformation[0],
+                        (void *)rec->ExceptionInformation[1] );
         TRACE_(seh)( "returning to handler\n" );
         RDI_sig(sigcontext) = (ULONG_PTR)data->jmp_buf;
         RSI_sig(sigcontext) = 1;
@@ -2113,6 +2120,14 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *sigconte
     }
     if ((frame = get_syscall_frame( data )))
     {
+        /* DRX-W44: the NTSTATUS below leaks out as the caller's BOOL return
+         * (e.g. BitBlt returning 0xC0000005) - log the fault details while
+         * the syscall id is still in the frame. */
+        if (rec->ExceptionCode == 0xc0000005 /* STATUS_ACCESS_VIOLATION */)
+            WARN_(win)( "DRX-W44 code=%08x addr=%p rw=%lu fault=%p syscall=%04x\n",
+                        rec->ExceptionCode, rec->ExceptionAddress,
+                        (unsigned long)rec->ExceptionInformation[0],
+                        (void *)rec->ExceptionInformation[1], frame->syscall_id );
         TRACE_(seh)( "returning to user mode ip=%016lx ret=%08x\n", frame->rip, rec->ExceptionCode );
         RAX_sig(sigcontext) = rec->ExceptionCode;
         R13_sig(sigcontext) = (ULONG_PTR)data->teb;
