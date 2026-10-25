@@ -40,6 +40,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(msg);
 WINE_DECLARE_DEBUG_CHANNEL(key);
 WINE_DECLARE_DEBUG_CHANNEL(relay);
+WINE_DECLARE_DEBUG_CHANNEL(win);
 
 #define QS_DRIVER       0x80000000
 #define QS_HARDWARE     0x40000000
@@ -2263,10 +2264,48 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         return 0;
     }
     case WM_WINE_UPDATEWINDOWSTATE:
+    {
+        static DWORD last_update;
+        DWORD now;
+
+        WARN_(win)( "DRX-W12 received hwnd %p\n", hwnd );
+        if (user_is_locked())
+        {
+            /* W12: re-post instead of destroying the post — the hole/unmap
+             * never happens if the only post is consumed here. The loop is
+             * bounded: the lock is held by this same thread and is gone when
+             * the enclosing entry point returns; each pass is a server
+             * round-trip, so the pump just spins at its own cadence until
+             * then (the same bound the W11b drop silently relied on). */
+            WARN_(win)( "DRX-W12 drop_locked_repost hwnd %p\n", hwnd );
+            NtUserPostMessage( hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+            break;
+        }
+        now = NtGetTickCount();
+        if (now - last_update < 16)
+        {
+            /* W12: re-post, do not destroy — the consumer-side window below
+             * collapses the repeats and the loop is bounded by the 16 ms
+             * clock itself: every re-post that arrives inside the window
+             * re-posts once more, and the first one that arrives outside it
+             * is processed and stops the chain. */
+            WARN_(win)( "DRX-W12 drop_16ms_repost hwnd %p\n", hwnd );
+            NtUserPostMessage( hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+            break;
+        }
+        last_update = now;
+        WARN_(win)( "DRX-W12 post hwnd %p\n", hwnd );
         update_window_state( hwnd );
         return 0;
+    }
     case WM_WINE_SETPIXELFORMAT:
         set_window_pixel_format( hwnd, wparam, lparam );
+        return 0;
+    case WM_WINE_REPRESENT:
+        /* W8 wake: arrival is the point — the child's pump waking is what
+         * re-composites the canvas; consuming it here keeps it out of the
+         * app's window proc and keeps the FIXME in default: silent */
+        WARN( "WS: w8wake hwnd %p\n", hwnd );
         return 0;
     case WM_WINE_TRACKMOUSEEVENT:
     {
@@ -2636,6 +2675,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
         accept_hardware_message( hw_id );
         return FALSE;
     }
+    TRACE( "HTOv0 retarget raw=%p child=%p hit=%d msg=%#x pt=(%d,%d)\n", msg->hwnd, msg->hwnd, hittest, msg->message, msg->pt.x, msg->pt.y );
     update_current_mouse_window( msg->hwnd, hittest, msg->pt );
 
     msg->pt = point_phys_to_win_dpi( msg->hwnd, msg->pt );

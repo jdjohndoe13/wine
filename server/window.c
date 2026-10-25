@@ -1257,6 +1257,10 @@ static inline struct window *get_top_clipping_window( struct window *win )
 }
 
 
+/* forward declaration of the cross-process clip helper (defined below get_visible_region) */
+static struct region *clip_cross_process_children( struct window *parent, struct region *region,
+                                                   int offset_x, int offset_y );
+
 /* compute the visible region of a window, in window coordinates */
 static struct region *get_visible_region( struct window *win, unsigned int flags )
 {
@@ -1300,6 +1304,14 @@ static struct region *get_visible_region( struct window *win, unsigned int flags
         if (!clip_children( win, NULL, region, win->client_rect.left, win->client_rect.top )) goto error;
     }
 
+    /* W9: always clip cross-process children out of the visible region, regardless of
+     * the CLIPCHILDREN flag — a foreign-process child can never share this window's
+     * surface and is a real occluding window on Windows, so the parent's paint must
+     * never land on its pixels (the white-out fix). */
+    if (!(region = clip_cross_process_children( win, region,
+               win->client_rect.left, win->client_rect.top )))
+        goto error;
+
     /* clip siblings of ancestors */
 
     offset_x = win->window_rect.left;
@@ -1334,6 +1346,55 @@ error:
     if (tmp) free_region( tmp );
     free_region( region );
     return NULL;
+}
+
+
+/* clip all cross-process descendants out of the visible region.
+ *
+ * A child owned by a different process can never share the parent's window surface
+ * (win->surface is per-process; the W6 wall), so the parent's own painting must never
+ * be allowed to land on the child's pixels. On Windows the child is a real occluding
+ * window so the parent's paint is clipped by the window manager regardless of the
+ * CLIPCHILDREN flag; on Wine the child has no X subwindow (it draws straight onto the
+ * shared toplevel whole_window), so without this clip the parent's white OnPaint
+ * overwrite destroys the child's content. This is the missing sibling of
+ * clip_pixel_format_children (server/window.c:1341) for the cross-process case.
+ *
+ * Same-process children are NOT clipped here — their parent->child repaint ordering
+ * into the shared surface is the existing correct mechanism. The recursion continues
+ * through same-process children so a cross-process canvas nested under a plain
+ * container (the WebView2 case) is still subtracted. */
+static struct region *clip_cross_process_children( struct window *parent, struct region *region,
+                                                   int offset_x, int offset_y )
+{
+    struct window *ptr;
+    struct region *tmp = create_empty_region();
+
+    if (!tmp) return NULL;
+    LIST_FOR_EACH_ENTRY( ptr, &parent->children, struct window, entry )
+    {
+        if (!(ptr->style & WS_VISIBLE)) continue;
+        if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
+
+        if (ptr->thread->process != parent->thread->process)
+        {
+            /* a foreign-process child: subtract its whole visible subtree, stop descending */
+            set_region_rect( tmp, &ptr->visible_rect );
+            if (ptr->win_region && !intersect_window_region( tmp, ptr )) break;
+            offset_region( tmp, offset_x, offset_y );
+            if (!(region = subtract_region( region, region, tmp ))) break;
+            if (is_region_empty( region )) break;
+        }
+        else if (!is_region_empty( region ))
+        {
+            /* same process: keep looking for nested cross-process children */
+            if (!(region = clip_cross_process_children( ptr, region,
+                     offset_x + ptr->client_rect.left, offset_y + ptr->client_rect.top )))
+                break;
+        }
+    }
+    free_region( tmp );
+    return region;
 }
 
 
@@ -3326,4 +3387,50 @@ DECL_HANDLER(set_window_layered_info)
         if (!was_layered) redraw_window( win, 0, RDW_ALLCHILDREN | RDW_INVALIDATE | RDW_ERASE | RDW_FRAME, 0 );
     }
     else set_win32_error( ERROR_INVALID_WINDOW_HANDLE );
+}
+
+/* W8: recursive walk posting WM_WINE_REPRESENT to every visible descendant whose
+ * window rect intersects the (screen-coords) dirty rect. The canvas child is
+ * nested under the WebView2 container, so the walk must recurse through plain children.
+ * NOTE: the server stores every window_rect in screen coordinates (the client-side
+ * coords are translated by the set_window_pos request), so the walk must run in screen
+ * coords too — the caller maps the request's parent-client rect up first.
+ * NOTE: the server has NO knowledge of client surfaces (they are a pure client-side
+ * win32u/x11drv mechanism — the canvas has no X subwindow and no surface in any
+ * process). The posts are therefore blind: the message is a pure queue wake consumed
+ * by win32u in the child before the app's window proc, and the pump waking is what
+ * makes the child re-composite its content. found = number of wakes posted. */
+static int represent_children_walk( struct window *win, const struct rectangle *screen_rect )
+{
+    struct window *child;
+    struct rectangle intersect;
+    int found = 0;
+
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+    {
+        if (!(child->style & WS_VISIBLE)) continue;
+        if (!intersect_rect( &intersect, &child->window_rect, screen_rect )) continue;
+
+        post_message( child->handle, WM_WINE_REPRESENT, 0, 0 );
+        found++;
+
+        found += represent_children_walk( child, screen_rect );
+    }
+    return found;
+}
+
+DECL_HANDLER(represent_children)
+{
+    struct window *win = get_window( req->handle );
+    struct rectangle screen_rect;
+
+    if (!win) return;
+
+    /* map the request rect (handle's client coords) into screen coords */
+    screen_rect = req->rect;
+    offset_rect( &screen_rect, win->client_rect.left, win->client_rect.top );
+
+    /* the wake rate is bounded by the client-side arm (>=16 ms per process);
+     * no server-side throttle needed */
+    reply->found = represent_children_walk( win, &screen_rect );
 }

@@ -577,17 +577,6 @@ void client_surface_present( struct client_surface *surface )
 
     pthread_mutex_lock( &surfaces_lock );
 
-    /* WS: presentq row: WARN-only instrument, no behavior change */
-    {
-        static DWORD ws_last_presentq;
-        DWORD ws_now = NtGetTickCount();
-        if (ws_now - ws_last_presentq > 1000)
-        {
-            ws_last_presentq = ws_now;
-            WARN( "WS: presentq hwnd %p surface %p\n", surface->hwnd, surface );
-        }
-    }
-
     if ((hwnd = surface->hwnd))
     {
         client_surface_update_locked( surface );
@@ -683,7 +672,7 @@ static void ws_reattach_compose_surface( HWND hwnd, HWND surface_win, const char
      * rect origin */
     rect = child_rects.client;
     OffsetRect( &rect, -owner_rects.visible.left, -owner_rects.visible.top );
-    if (rect.right - rect.left < 300 || rect.bottom - rect.top < 200)  /* same big-rect gate family as dce.c ws_probe_big */
+    if (rect.right - rect.left < 300 || rect.bottom - rect.top < 200)  /* only recompose big hosts */
     {
         window_surface_release( surface );
         return;
@@ -695,8 +684,6 @@ static void ws_reattach_compose_surface( HWND hwnd, HWND surface_win, const char
     window_surface_unlock( surface );
     window_surface_flush( surface );
     window_surface_release( surface );
-
-    WARN( "WS: reattach hwnd %p rect %s surface %p hook %s\n", hwnd, wine_dbgstr_rect( &rect ), surface, hook );
 }
 
 /* W5 white-out fix: find an attached client surface on the window itself or, failing that,
@@ -724,7 +711,7 @@ static struct client_surface *ws_find_attached_surface_subtree( HWND hwnd, UINT 
 
     if (&surface->entry != &client_surfaces) return surface;
 
-    /* else search the child subtree, same enumeration idiom as dce.c ws_probe_big */
+    /* else search the child subtree */
     if ((list = list_window_children( hwnd )))
     {
         for (i = 0; list[i]; i++)
@@ -738,102 +725,82 @@ static struct client_surface *ws_find_attached_surface_subtree( HWND hwnd, UINT 
     return NULL;
 }
 
-/* W7 white-out fix (dce-release hook): a child window that renders via a client surface has no
- * own win32u window surface (win->surface is NULL — children use the parent surface — or the
- * dummy one); when its DCE is released (the paint is done), the parent composition may still hold
- * stale content over the child rect. Arm a deferred client-surface present: release_dce() runs
- * with the user lock held and inside dce_list iteration, so the present cannot run there —
- * client_surface_present() takes surfaces_lock and then the user lock (via NtUserGetAncestor /
- * get_win_ptr), the reverse order would be an ABBA deadlock against the established
- * surfaces_lock -> user_lock order, and a present in the middle of a dce_list walk would
- * re-enter DC code. The arm only records the hwnd (pending slot, own lock); the present runs at
- * the next DCE release / ReleaseDC outside the user lock, where the surfaces_lock -> user_lock
- * order is the established one. The park path (use_window_client_surface) keeps the hwnd on the
- * unused-list entry, so a parked surface can still be matched by hwnd. */
-static pthread_mutex_t ws_w7_pending_lock = PTHREAD_MUTEX_INITIALIZER;
-static HWND ws_w7_pending_hwnd;
-static LONG ws_w7_in_flush;
+/* W8 white-out fix (cross-process wake): the app's whitening (the Win32-correct
+ * white OnPaint fallback) lands on the parent's window surface and, when flushed,
+ * paints over the canvas child's area on the shared toplevel drawable. The canvas
+ * has no X subwindow and no client surface in any process (msedge draws directly
+ * onto the toplevel), so the only recovery is the msedge thread re-compositing its
+ * own content. W8: the app's window_surface_flush arms a pending hwnd + dirty rect
+ * (rate-limited, own lock); at the safe outside-lock point in flush_window_surfaces
+ * ONE server request (represent_children) is issued; the server walks the window's
+ * subtree for visible children whose rect intersects the dirty rect and posts
+ * WM_WINE_REPRESENT to each. The message is a pure QUEUE WAKE: win32u consumes it
+ * before the app's window proc (the handler is a no-op — there is no surface to
+ * present) and the child's pump waking is what re-composites the canvas.
+ * A/B of record: W9 clip alone = stale white survives (the eraser destroyed the
+ * content and nothing re-paints it); the wake alone = the eraser wins; clip +
+ * wake = fixed. */
+static pthread_mutex_t ws_w8_pending_lock = PTHREAD_MUTEX_INITIALIZER;
+static HWND ws_w8_pending_hwnd;
+static RECT ws_w8_pending_rect;
+static DWORD ws_w8_last_arm;
+static LONG ws_w8_in_flush;
 
-void ws_w7_arm_client_surface( HWND hwnd )
+void ws_w8_arm_wake( HWND hwnd, const RECT *rect )
 {
-    WND *win;
+    DWORD now = NtGetTickCount();
 
-    if (ws_w7_in_flush) return; /* re-entrant arm from the present itself, skip */
+    if (ws_w8_in_flush) return; /* re-entrant arm from the wake request itself, skip */
 
-    /* the released window must not own a real window surface: it renders via a client surface */
-    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
-    if (win->surface && win->surface != &dummy_surface)
+    if (now - ws_w8_last_arm < 16) return; /* rate-limit the arm at >=16 ms */
+    ws_w8_last_arm = now;
+
+    pthread_mutex_lock( &ws_w8_pending_lock );
+    if (!ws_w8_pending_hwnd)
     {
-        release_win_ptr( win );
-        return;
+        ws_w8_pending_hwnd = hwnd;
+        ws_w8_pending_rect = *rect;
     }
-    release_win_ptr( win );
-
-    pthread_mutex_lock( &ws_w7_pending_lock );
-    if (!ws_w7_pending_hwnd) ws_w7_pending_hwnd = hwnd;
-    pthread_mutex_unlock( &ws_w7_pending_lock );
+    pthread_mutex_unlock( &ws_w8_pending_lock );
 }
 
-void ws_w7_flush_client_surface_present( void )
+void ws_w8_flush_wake( void )
 {
-    struct client_surface *surface = NULL;
-    UINT parked = 0;
     HWND hwnd;
+    RECT rect;
 
-    if (InterlockedCompareExchange( &ws_w7_in_flush, 1, 0 )) return; /* already flushing */
+    if (InterlockedCompareExchange( &ws_w8_in_flush, 1, 0 )) return; /* already flushing */
 
-    /* the flush must run outside the user lock: client_surface_present() takes surfaces_lock
-     * and then the user lock (via NtUserGetAncestor / get_win_ptr); running it while the user
-     * lock is held would be the reverse (user -> surfaces) order, i.e. ABBA */
+    /* the flush runs outside the user lock (the server call and the child-side handler
+     * take the surfaces_lock -> user_lock order; running it while the user lock is held
+     * would be the reverse order, i.e. ABBA) */
     if (user_is_locked())
     {
-        InterlockedExchange( &ws_w7_in_flush, 0 );
+        InterlockedExchange( &ws_w8_in_flush, 0 );
         return;
     }
 
-    pthread_mutex_lock( &ws_w7_pending_lock );
-    hwnd = ws_w7_pending_hwnd;
-    ws_w7_pending_hwnd = 0;
-    pthread_mutex_unlock( &ws_w7_pending_lock );
+    pthread_mutex_lock( &ws_w8_pending_lock );
+    hwnd = ws_w8_pending_hwnd;
+    rect = ws_w8_pending_rect;
+    ws_w8_pending_hwnd = 0;
+    pthread_mutex_unlock( &ws_w8_pending_lock );
 
     if (!hwnd)
     {
-        InterlockedExchange( &ws_w7_in_flush, 0 );
+        InterlockedExchange( &ws_w8_in_flush, 0 );
         return;
     }
 
-    /* find the client surface for the window: the attached list first, then the parked
-     * (unused) list; the park path keeps the hwnd, so a parked entry can still be matched */
-    pthread_mutex_lock( &surfaces_lock );
-    LIST_FOR_EACH_ENTRY( surface, &client_surfaces, struct client_surface, entry )
-        if (surface->hwnd == hwnd) break;
-    if (&surface->entry != &client_surfaces) parked = 0;
-    else
+    SERVER_START_REQ( represent_children )
     {
-        LIST_FOR_EACH_ENTRY( surface, &unused_surfaces, struct client_surface, entry )
-            if (surface->hwnd == hwnd) break;
-        if (&surface->entry != &unused_surfaces) parked = 1;
-        else surface = NULL;
+        req->handle = wine_server_user_handle( hwnd );
+        req->rect   = wine_server_rectangle( rect );
+        wine_server_call( req );
     }
+    SERVER_END_REQ;
 
-    /* throttle: only present when the surface is flagged updated (geometry changed or the
-     * Track-3 purge marked it); the flag is not consumed here — opengl get_size owns it */
-    if (surface && !surface->updated)
-    {
-        surface = NULL;
-    }
-    else if (surface) client_surface_add_ref( surface );
-
-    pthread_mutex_unlock( &surfaces_lock );
-
-    if (surface)
-    {
-        WARN( "WS: present-nil hwnd %p parked %u\n", hwnd, parked );
-        client_surface_present( surface );
-        client_surface_release( surface );
-    }
-
-    InterlockedExchange( &ws_w7_in_flush, 0 );
+    InterlockedExchange( &ws_w8_in_flush, 0 );
 }
 
 /* W5 white-out fix (style-path show hook): the app's visibility flips ride SetWindowLong /
@@ -858,14 +825,12 @@ static void ws_compose_on_show( HWND hwnd, const char *hook )
     if (win == WND_OTHER_PROCESS)
     {
         client_surface_release( surface );
-        WARN( "WS: redirty hook %s hwnd %p skipped cross-proc\n", hook, hwnd );
         return;
     }
     release_win_ptr( win );
 
     ws_reattach_compose_surface( surf_hwnd, root, hook );
     client_surface_present( surface );
-    WARN( "WS: redirty hook %s hwnd %p subtree %p surface %p root %p\n", hook, hwnd, surf_hwnd, surface, root );
     client_surface_release( surface );
 }
 
@@ -888,7 +853,6 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
 
         /* surface wasn't used, it shouldn't be in any list */
         list_add_tail( &client_surfaces, &surface->entry );
-        WARN( "WS: attach client surface %s hwnd %p\n", debugstr_client_surface( surface ), surface->hwnd );
         client_surface_update_locked( surface );
         attach_hwnd = surface->hwnd;
     }
@@ -896,7 +860,6 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
     {
         list_remove( &surface->entry ); /* remove it from client_surfaces, if it was used */
         list_add_head( &unused_surfaces, &surface->entry ); /* add it to the head, so we discard older ones */
-        WARN( "WS: park client surface %s hwnd %p (content retained)\n", debugstr_client_surface( surface ), surface->hwnd );
         client_surface_add_ref( surface );
     }
 
@@ -2853,8 +2816,6 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     if (ret)
     {
         TRACE( "win %p surface %p -> %p\n", hwnd, old_surface, new_surface );
-        WARN( "WS: swp hwnd %p old_surface %p new_surface %p flags %04x show %u hide %u\n", hwnd, old_surface,
-              new_surface, swp_flags, !!(swp_flags & SWP_SHOWWINDOW), !!(swp_flags & SWP_HIDEWINDOW) );
         /* W5 white-out fix (show hook): widen the W4 show hook beyond the flipping node itself —
          * the attached client surface usually lives on a descendant (canvas child) and is still
          * attached (never parked) at show time. Keep the W4 row verbatim (hook "show") for the
@@ -2874,8 +2835,6 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             if (sub_surface)
             {
                 client_surface_present( sub_surface );
-                WARN( "WS: redirty hook show-attach hwnd %p subtree %p surface %p root %p\n", hwnd,
-                      surf_hwnd, sub_surface, NtUserGetAncestor( hwnd, GA_ROOT ) );
                 client_surface_release( sub_surface );
             }
         }

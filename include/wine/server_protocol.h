@@ -3791,6 +3791,24 @@ struct set_window_pos_reply
 #define SET_WINPOS_PIXEL_FORMAT     0x02
 #define SET_WINPOS_LAYERED_WINDOW   0x04
 
+/* W8: ask the server to wake the cross-process children of a window whose content
+ * was just overwritten on the shared toplevel drawable (app flush -> server post ->
+ * child pump wake -> child re-composites). The server walks the window's subtree for
+ * visible children intersecting the rect and posts WM_WINE_REPRESENT to each; the
+ * message is consumed by win32u in the child and the queue wake is the point. */
+struct represent_children_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+    struct rectangle rect;
+};
+struct represent_children_reply
+{
+    struct reply_header __header;
+    int            found;
+    char __pad_12[4];
+};
+
 
 struct get_window_rectangles_request
 {
@@ -6418,6 +6436,7 @@ enum request
     REQ_get_window_children_from_point,
     REQ_get_window_tree,
     REQ_set_window_pos,
+    REQ_represent_children,
     REQ_get_window_rectangles,
     REQ_get_window_text,
     REQ_set_window_text,
@@ -6734,6 +6753,7 @@ union generic_request
     struct get_window_children_from_point_request get_window_children_from_point_request;
     struct get_window_tree_request get_window_tree_request;
     struct set_window_pos_request set_window_pos_request;
+    struct represent_children_request represent_children_request;
     struct get_window_rectangles_request get_window_rectangles_request;
     struct get_window_text_request get_window_text_request;
     struct set_window_text_request set_window_text_request;
@@ -7048,6 +7068,7 @@ union generic_reply
     struct get_window_children_from_point_reply get_window_children_from_point_reply;
     struct get_window_tree_reply get_window_tree_reply;
     struct set_window_pos_reply set_window_pos_reply;
+    struct represent_children_reply represent_children_reply;
     struct get_window_rectangles_reply get_window_rectangles_reply;
     struct get_window_text_reply get_window_text_reply;
     struct set_window_text_reply set_window_text_reply;

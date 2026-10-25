@@ -673,11 +673,6 @@ void window_surface_flush( struct window_surface *surface )
                                    shape_changed, shape_info, shape_bits ))
         {
             reset_bounds( &surface->bounds );
-
-            /* W8: the flushed content is now on the parent's drawable — if this surface
-             * hosts client-surface children (the canvas), they must be re-presented on
-             * top; arm the deferred server round-trip (see the W8 comment in window.c) */
-            ws_w8_arm_wake( surface->hwnd, &dirty );
         }
 
         if (ws_probe_big( surface ) && color_info->bmiHeader.biBitCount == 32)
@@ -881,10 +876,6 @@ void flush_window_surfaces( BOOL idle )
         window_surface_flush( surface );
 done:
     pthread_mutex_unlock( &surfaces_lock );
-
-    /* W8: run the deferred represent-children request armed by the flushes above (the
-     * server round-trip must not run under surfaces_lock / the user lock) */
-    ws_w8_flush_wake();
 }
 
 /***********************************************************************
