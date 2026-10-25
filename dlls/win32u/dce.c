@@ -158,7 +158,13 @@ static struct scaled_surface *get_scaled_surface( struct window_surface *window_
 static void scaled_surface_set_clip( struct window_surface *window_surface, const RECT *rects, UINT count )
 {
     struct scaled_surface *surface = get_scaled_surface( window_surface );
-    HRGN hrgn = map_dpi_region( window_surface->clip_region, surface->dpi_from, surface->dpi_to );
+    HRGN hrgn;
+
+    /* treex: a scaled surface whose target is itself is degenerate; the caller is
+     * already holding this surface's mutex, so recursing into the target would self-deadlock */
+    if (surface->target_surface == window_surface) return;
+
+    hrgn = map_dpi_region( window_surface->clip_region, surface->dpi_from, surface->dpi_to );
     window_surface_set_clip( surface->target_surface, hrgn );
     if (hrgn) NtGdiDeleteObjectApp( hrgn );
 }
@@ -170,6 +176,12 @@ static BOOL scaled_surface_flush( struct window_surface *window_surface, const R
     struct scaled_surface *surface = get_scaled_surface( window_surface );
     RECT src = *dirty, dst;
     HDC hdc_dst, hdc_src;
+
+    /* treex: a scaled surface whose target is itself is degenerate; the caller already
+     * holds this surface's mutex, so recursing into the target would self-deadlock.
+     * Nothing to blit to — the outer window_surface_flush() resets bounds, so a
+     * successful no-op is the correct terminal state. */
+    if (surface->target_surface == window_surface) return TRUE;
 
     src.left &= ~7;
     src.top &= ~7;
@@ -574,7 +586,15 @@ struct window_surface *window_surface_create( const struct window_surface_funcs 
         return NULL;
     }
 
-    pthread_mutex_init( &surface->mutex, NULL );
+    /* treex: the surface mutex is re-entrant by design — a GDI op holds it (dibdrv
+     * lock_surface) across a message-driven redraw (WM_PAINT/WM_ERASEBKGND -> a
+     * different DC on the same surface -> lock_surface again) and across
+     * scaled_surface_flush -> target flush. A plain mutex self-deadlocks (owner==self). */
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init( &attr );
+    pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
+    pthread_mutex_init( &surface->mutex, &attr );
+    pthread_mutexattr_destroy( &attr );
 
     memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
 
@@ -651,7 +671,14 @@ void window_surface_flush( struct window_surface *surface )
 
         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
                                    shape_changed, shape_info, shape_bits ))
+        {
             reset_bounds( &surface->bounds );
+
+            /* W8: the flushed content is now on the parent's drawable — if this surface
+             * hosts client-surface children (the canvas), they must be re-presented on
+             * top; arm the deferred server round-trip (see the W8 comment in window.c) */
+            ws_w8_arm_wake( surface->hwnd, &dirty );
+        }
 
         if (ws_probe_big( surface ) && color_info->bmiHeader.biBitCount == 32)
         {
@@ -769,6 +796,15 @@ void window_surface_set_clip( struct window_surface *surface, HRGN clip_region )
         {
             surface->funcs->set_clip( surface, data->rects, data->numRects );
             GDI_ReleaseObj( clip_region );
+            /* W11 observable: the GC flush clip is being (re)set; the canvas reveal
+             * must show numRects >= 2 (bands around the hole) BEFORE the first
+             * post-reveal WS: flush2 covering the canvas rect */
+            WARN( "WS: w11clip hwnd %p rects %u r0 %ld,%ld-%ld,%ld\n", surface->hwnd,
+                  data->numRects,
+                  data->numRects ? data->rects[0].left : 0,
+                  data->numRects ? data->rects[0].top : 0,
+                  data->numRects ? data->rects[0].right : 0,
+                  data->numRects ? data->rects[0].bottom : 0 );
         }
     }
 
@@ -845,6 +881,10 @@ void flush_window_surfaces( BOOL idle )
         window_surface_flush( surface );
 done:
     pthread_mutex_unlock( &surfaces_lock );
+
+    /* W8: run the deferred represent-children request armed by the flushes above (the
+     * server round-trip must not run under surfaces_lock / the user lock) */
+    ws_w8_flush_wake();
 }
 
 /***********************************************************************
@@ -1008,10 +1048,8 @@ static void release_dce( struct dce *dce )
     dce->hwnd     = 0;
     dce->flags   &= DCX_CACHE;
 
-    /* W7: arm the deferred client-surface present for this window (the present itself must not
-     * run here — we are under the user lock and inside dce_list iteration; see the W7 comment
-     * in window.c). The arm only records the hwnd when the window has no real window surface. */
-    ws_w7_arm_client_surface( hwnd );
+    /* W7 arm removed: the correct predicate is the server-side PAINT_HAS_SURFACE walk,
+     * armed from window_surface_flush (see the W8 comment in window.c) */
 }
 
 /***********************************************************************
@@ -1238,8 +1276,8 @@ void free_dce( struct dce *dce, HWND hwnd, struct list *drawables )
         free( dce_to_free );
     }
 
-    /* W7: run the deferred client-surface present armed by the release_dce calls above */
-    ws_w7_flush_client_surface_present();
+    /* W7 flush removed: the represent-children request now runs from
+     * flush_window_surfaces (see the W8 comment in window.c) */
 }
 
 BOOL is_cache_dc( HDC hdc )
@@ -1369,10 +1407,8 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
     }
     user_unlock();
 
-    /* W7: run the deferred client-surface present armed by release_dce (we are outside the
-     * user lock here; client_surface_present takes surfaces_lock -> user_lock, the order the
-     * existing attach/show hooks already use). */
-    ws_w7_flush_client_surface_present();
+    /* W7 flush removed: the represent-children request now runs from
+     * flush_window_surfaces (see the W8 comment in window.c) */
 
     release_opengl_drawables( &drawables );
     return ret;
