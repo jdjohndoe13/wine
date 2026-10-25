@@ -307,8 +307,18 @@ static void create_object(Binding *binding)
         hres = create_mime_object(binding, &clsid, clsid_str);
         free(clsid_str);
     }else {
-        FIXME("Could not find object for MIME %s\n", debugstr_w(binding->mime));
-        hres = REGDB_E_CLASSNOTREG;
+        /* wine-treex: fallback so half-registered prefixes (no MIME database) still bind the HTML doc object */
+        static const WCHAR html_clsidW[] = L"{25336920-03F9-11CF-8FD0-00AA00686F13}";
+
+        if(!wcsicmp(binding->mime, L"text/html") && SUCCEEDED(CLSIDFromString(html_clsidW, &clsid))) {
+            FIXME("No MIME mapping for %s, using CLSID_HTMLDocument\n", debugstr_w(binding->mime));
+            clsid_str = wcsdup(html_clsidW);
+            hres = create_mime_object(binding, &clsid, clsid_str);
+            free(clsid_str);
+        }else {
+            FIXME("Could not find object for MIME %s\n", debugstr_w(binding->mime));
+            hres = REGDB_E_CLASSNOTREG;
+        }
     }
 
     IBindStatusCallback_OnProgress(binding->callback, 0, 0, BINDSTATUS_ENDSYNCOPERATION, NULL);
