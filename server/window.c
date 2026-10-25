@@ -1362,20 +1362,6 @@ error:
 }
 
 
-/* W13: minimal rectangle formatter for the DRX-W13 traces (no debugstr in
- * the server); single-threaded request handling makes the static buffer safe. */
-static const char *rect_str( const struct rectangle *rect )
-{
-    static char buffer[6][32];
-    static int count;
-
-    count = (count + 1) % 6;
-    snprintf( buffer[count], sizeof(buffer[count]), "%d,%d,%d,%d",
-              rect->left, rect->top, rect->right, rect->bottom );
-    return buffer[count];
-}
-
-
 /* clip all cross-process descendants out of the visible region.
  *
  * A child owned by a different process can never share the parent's window surface
@@ -1410,9 +1396,6 @@ static struct region *clip_cross_process_children( struct window *parent, struct
             if (ptr->win_region && !intersect_window_region( tmp, ptr )) break;
             offset_region( tmp, offset_x, offset_y );
             if (!(region = subtract_region( region, region, tmp ))) break;
-            fprintf( stderr, "DRX-W13 hole top=%x child=%x host_vis=%d child_vis=%d rect=%s\n",
-                     parent->handle, ptr->handle, is_visible( parent ), is_visible( ptr ),
-                     rect_str( &ptr->visible_rect ) );
             if (is_region_empty( region )) break;
         }
         else if (!is_region_empty( region ))
@@ -2856,7 +2839,6 @@ static void post_to_cross_process_descendants( struct window *parent, struct pro
         if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
         if (ptr->thread->process != process)
         {
-            fprintf( stderr, "DRX-W13 post_child %x\n", ptr->handle );
             post_message( ptr->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
             continue;
         }
@@ -2895,8 +2877,6 @@ static struct region *add_cross_process_descendant_rects( struct window *parent,
             if (ptr->win_region && !intersect_window_region( tmp, ptr )) break;
             offset_region( tmp, offset_x, offset_y );
             if (!union_region( region, region, tmp )) break;
-            fprintf( stderr, "DRX-W13 hole_invalidate %x rect %s\n",
-                     ptr->handle, rect_str( &ptr->visible_rect ) );
         }
         else if (!is_region_empty( region ))
         {
@@ -2908,6 +2888,27 @@ static struct region *add_cross_process_descendant_rects( struct window *parent,
     }
     free_region( tmp );
     return region;
+}
+
+/* W20: map a region from the client coordinates of the ancestor 'cur' into the
+ * client coordinates of the toplevel 'top' (a strict ancestor of cur, or cur
+ * itself). Accumulate the client origins of every ancestor from cur up to but
+ * not including top: client_rect is by definition in the parent's client
+ * system, so each step is a pure += client_rect.left/top (the same walk as
+ * client_to_screen_rect() and get_window_visible_rect()). The window_rect
+ * two-step of validate_parents() is NOT needed here: that walk converts between
+ * two window-coord systems (update regions are window-relative), while the hole
+ * and the redraw_window() input are both client-coord systems. */
+static void map_region_to_top_client( struct region *region, struct window *cur, struct window *top )
+{
+    int offset_x = 0, offset_y = 0;
+
+    for ( ; cur && cur != top; cur = cur->parent )
+    {
+        offset_x += cur->client_rect.left;
+        offset_y += cur->client_rect.top;
+    }
+    offset_region( region, offset_x, offset_y );
 }
 
 /* W16: the client's parent-invisible fast path (dlls/win32u/window.c
@@ -2961,25 +2962,68 @@ static void style_visibility_changed( struct window *win, unsigned int old_style
                                                 win->client_rect.top - win->window_rect.top );
             if (!is_region_empty( hole ))
             {
-                fprintf( stderr, "DRX-W16 hide_invalidate %x\n", win->handle );
                 /* W17: wake the toplevel's client so update_surface_region()
                  * removes the stale GC-clip hole before the redraw below
                  * repaints through the restored clip (queued first, so the
                  * post runs ahead of the lazy WM_PAINT). */
                 if (top->paint_flags & PAINT_HAS_SURFACE)
                 {
-                    fprintf( stderr, "DRX-W17 hole_wake %x top %x\n", win->handle, top->handle );
                     post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
                 }
+                /* W16 hole is in win's window coords (client-origin seed in
+                 * add_cross_process_descendant_rects()); + window_rect puts it
+                 * into win->parent's client coords. */
                 offset_region( hole, win->window_rect.left, win->window_rect.top );
-                redraw_window( win->parent, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
+                /* W20: the host hid via the parent-invisible fast path, so
+                 * win->parent is itself hidden — a hidden window never gets
+                 * WM_PAINT and update regions never propagate upward
+                 * (validate_parents only clips, never creates). Invalidate the
+                 * visible toplevel instead; the redraw_window() cascade
+                 * (WS_VISIBLE-only) reaches the editor under it. */
+                if (top->paint_flags & PAINT_HAS_SURFACE)
+                {
+                    map_region_to_top_client( hole, win->parent, top );
+                    redraw_window( top, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
+                }
             }
             free_region( hole );
         }
     }
-    fprintf( stderr, "DRX-W16 style_vis %x top %x vis_top %d vis_win %d old_eff %d cross %d post %d\n",
-             win->handle, top->handle, is_visible( top ), is_visible( win ),
-             old_eff, cross, post );
+
+    /* W19: the canvas's OWN hide (cross-process, fast path) is the event that
+     * actually closes the hole (its WS_VISIBLE is now clear). Wake the
+     * surface owner and re-invalidate the former hole — the host-side W17
+     * wake fires too early (async msedge hide) and re-reads the hole. */
+    if (cross && own_hide && !is_visible( win ) &&
+        (top->paint_flags & PAINT_HAS_SURFACE) && is_visible( top ))
+    {
+        if ((hole = create_empty_region()))
+        {
+            set_region_rect( hole, &win->visible_rect );
+            if (win->win_region) intersect_window_region( hole, win );
+            post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+            /* W20: the visible_rect is already in win->parent's client coords
+             * (the old +window_rect offset double-added the origin — masked by
+             * the frameless canvas's ~0 window origin). The canvas's own hide
+             * arrives via the fast path while the host chain is hidden, so the
+             * old win->parent target never painted; retarget the toplevel. */
+            map_region_to_top_client( hole, win->parent, top );
+            /* W25: when the canvas was reparented to a parking window before
+             * hiding (NtUserSetParent), win->parent is no longer an ancestor
+             * of the toplevel, so the mapped hole lands outside it (e.g.
+             * mapped (1338,110)-(2396,878) vs toplevel client (63,161,1332,759)).
+             * The redraw_window( top, hole ) below is then cropped to NULL —
+             * zero invalidation — and the editor under the former canvas area
+             * never repaints (stale HTML frame). If the mapped hole is empty
+             * or misses the toplevel's client rect (the mapped region and
+             * top->client_rect are both in the toplevel's client coord system),
+             * fall back to invalidating the whole toplevel client rect. */
+            if (is_region_empty( hole ) || !rect_in_region( hole, &top->client_rect ))
+                set_region_rect( hole, &top->client_rect );
+            redraw_window( top, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
+        }
+        free_region( hole );
+    }
 }
 
 /* set the position and Z order of a window */
@@ -3117,7 +3161,6 @@ DECL_HANDLER(set_window_pos)
      * the post-cascade truth) and XUnmapWindow's the re-mapped X window. */
     if (own_show)
     {
-        fprintf( stderr, "DRX-W15b own_show %x top %x\n", win->handle, top->handle );
         post_message( win->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
     }
     /* W13v2: the canvas's own thread must see the host hide/show too — its
@@ -3149,19 +3192,12 @@ DECL_HANDLER(set_window_pos)
                                                 win->client_rect.top - win->window_rect.top );
             if (!is_region_empty( hole ))
             {
-                fprintf( stderr, "DRX-W13v4 hide_invalidate %x\n", win->handle );
                 offset_region( hole, old_window.left, old_window.top );
                 redraw_window( win->parent, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
             }
             free_region( hole );
         }
     }
-    if (eff_diff || rect_diff || post)  /* temporary gate trace, quiet on the churn stream */
-        /* W13: own_win = the child's own WS_VISIBLE flag vs vis_win = effective
-         * (is_visible, incl. ancestors) — distinguishes own-flag vs ancestor flips */
-        fprintf( stderr, "DRX-W12 win %x top %x vis_top %d vis_win %d own_win %d old_eff %d cross %d rect %d post %d\n",
-                 win->handle, top->handle, is_visible( top ), is_visible( win ),
-                 !!(win->style & WS_VISIBLE), old_effective, cross, rect_diff, post );
 }
 
 
