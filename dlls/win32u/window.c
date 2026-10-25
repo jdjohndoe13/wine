@@ -332,28 +332,102 @@ void detach_client_surfaces( HWND hwnd )
     pthread_mutex_unlock( &surfaces_lock );
 }
 
-static RECT get_client_surface_rects( HWND toplevel, HWND hwnd, RECT *monitor_rect )
+/* server-fresh copy of the get_window_rects() request body, for callers that suspect the cached
+ * client-side rects went stale; pure query, no locking beyond the server request itself */
+static BOOL get_window_rects_authoritative( HWND hwnd, enum coords_relative relative,
+                                            struct window_rects *rects, struct ratio dpi )
 {
-    struct ratio dpi = get_dpi_for_window( hwnd ), raw_dpi;
-    struct window_rects rects, monitor_rects;
+    BOOL ret = FALSE;
+
+    SERVER_START_REQ( get_window_rectangles )
+    {
+        req->handle = wine_server_user_handle( hwnd );
+        req->relative = relative;
+        req->dpi = dpi;
+        if ((ret = !wine_server_call_err( req )))
+        {
+            rects->window = wine_server_get_rect( reply->window );
+            rects->client = wine_server_get_rect( reply->client );
+            rects->visible = wine_server_get_rect( reply->visible );
+        }
+    }
+    SERVER_END_REQ;
+    return ret;
+}
+
+#define CLIENT_SURFACE_RECT_SLOP 2 /* px per edge a client surface rect may go past the toplevel bounds */
+
+/* clamp the given client surface rect to the toplevel client bounds expressed in the surface rect
+ * coordinate space (virtual space uses rects, monitor space the raw monitor twin, both offset by
+ * their own visible rect origin). Returns TRUE when the stale rect was clamped. */
+static BOOL client_surface_fit_rect( RECT *rect, const struct window_rects *rects,
+                                     const struct window_rects *monitor_rects, BOOL is_monitor, int slop )
+{
+    const struct window_rects *cur = is_monitor ? monitor_rects : rects;
+    RECT bound = cur->client, expanded, stale = *rect;
+
+    OffsetRect( &bound, -cur->visible.left, -cur->visible.top );
+    if (IsRectEmpty( &bound )) return FALSE;
+
+    expanded = bound;
+    expanded.left   -= slop;
+    expanded.top    -= slop;
+    expanded.right  += slop;
+    expanded.bottom += slop;
+    if (rect->left >= expanded.left && rect->top >= expanded.top &&
+        rect->right <= expanded.right && rect->bottom <= expanded.bottom)
+        return FALSE;
+
+    intersect_rect( rect, &stale, &bound );
+    WARN( "clamping stale client surface rect %s to %s\n", wine_dbgstr_rect( &stale ), wine_dbgstr_rect( rect ) );
+    return TRUE;
+}
+
+/* shared tail of get_client_surface_rects_ex: virt_rect on entry holds the client rect relative to
+ * the toplevel client area; both output rects are turned into toplevel visible-rect-relative
+ * positions and monitor_rect additionally gets mapped to the raw monitor dpi */
+static void client_surface_rects_map( HWND hwnd, struct ratio dpi, const struct window_rects *rects,
+                                      const struct window_rects *monitor_rects, RECT *virt_rect, RECT *monitor_rect )
+{
+    struct ratio raw_dpi;
+
+    /* use toplevel visible rect relative position, so drivers can then assume it */
+    get_win_monitor_dpi( hwnd, &raw_dpi );
+    *monitor_rect = map_dpi_rect( *virt_rect, dpi, raw_dpi );
+    OffsetRect( monitor_rect, monitor_rects->client.left - monitor_rects->visible.left,
+                monitor_rects->client.top - monitor_rects->visible.top );
+    OffsetRect( virt_rect, rects->client.left - rects->visible.left,
+                rects->client.top - rects->visible.top );
+}
+
+static BOOL get_client_surface_rects_ex( HWND toplevel, HWND hwnd, struct window_rects *rects,
+                                         struct window_rects *monitor_rects, RECT *virt_rect, RECT *monitor_rect )
+{
+    struct ratio dpi = get_dpi_for_window( hwnd );
     RECT rect = {0};
 
     if (!toplevel) toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
-    get_window_rects( toplevel, COORDS_PARENT, &rects, dpi );
-    monitor_rects = map_window_rects_virt_to_raw( rects, dpi );
+    if (!get_window_rects( toplevel, COORDS_PARENT, rects, dpi )) return FALSE;
+    *monitor_rects = map_window_rects_virt_to_raw( *rects, dpi );
 
-    if (get_present_rect( hwnd, &rect, dpi )) OffsetRect( &rect, -rects.client.left, -rects.client.top );
+    if (get_present_rect( hwnd, &rect, dpi )) OffsetRect( &rect, -rects->client.left, -rects->client.top );
     else if (get_client_rect( hwnd, &rect, dpi )) map_window_points( hwnd, toplevel, (POINT *)&rect, 2, dpi );
 
-    get_win_monitor_dpi( hwnd, &raw_dpi );
-    *monitor_rect = map_dpi_rect( rect, dpi, raw_dpi );
+    *virt_rect = rect;
+    client_surface_rects_map( hwnd, dpi, rects, monitor_rects, virt_rect, monitor_rect );
+    return TRUE;
+}
 
-    /* use toplevel visible rect relative position, so drivers can then assume it */
-    OffsetRect( monitor_rect, monitor_rects.client.left - monitor_rects.visible.left,
-                monitor_rects.client.top - monitor_rects.visible.top );
-    OffsetRect( &rect, rects.client.left - rects.visible.left,
-                rects.client.top - rects.visible.top );
+static RECT get_client_surface_rects( HWND toplevel, HWND hwnd, RECT *monitor_rect )
+{
+    struct window_rects rects, monitor_rects;
+    RECT rect = {0};
 
+    if (!get_client_surface_rects_ex( toplevel, hwnd, &rects, &monitor_rects, &rect, monitor_rect ))
+    {
+        SetRectEmpty( &rect );
+        SetRectEmpty( monitor_rect );
+    }
     return rect;
 }
 
@@ -361,9 +435,50 @@ static void client_surface_update_locked( struct client_surface *surface )
 {
     RECT virtual_rect = surface->virtual_rect, monitor_rect = surface->monitor_rect;
     HWND toplevel = surface->toplevel;
+    struct window_rects rects, monitor_rects;
+    BOOL snapshot_ok, clamped;
 
     surface->toplevel = NtUserGetAncestor( surface->hwnd, GA_ROOT );
-    surface->virtual_rect = get_client_surface_rects( surface->toplevel, surface->hwnd, &surface->monitor_rect );
+    snapshot_ok = get_client_surface_rects_ex( surface->toplevel, surface->hwnd, &rects, &monitor_rects,
+                                               &surface->virtual_rect, &surface->monitor_rect );
+
+    /* pane re-creates and window state changes can leave the cached toplevel rects desynced from
+     * the host, feeding stale geometry variants to the driver; validate both rects against the
+     * snapshot bounds and clamp stale variants before handing them to the driver */
+    if (snapshot_ok && surface->toplevel && !IsRectEmpty( &rects.client ) && !IsRectEmpty( &monitor_rects.client ))
+    {
+        clamped  = client_surface_fit_rect( &surface->virtual_rect, &rects, &monitor_rects, FALSE, CLIENT_SURFACE_RECT_SLOP );
+        clamped |= client_surface_fit_rect( &surface->monitor_rect, &rects, &monitor_rects, TRUE, CLIENT_SURFACE_RECT_SLOP );
+
+        /* something was clamped: the cached rects can't be trusted, re-derive everything from
+         * server-fresh rects and re-validate */
+        if (clamped)
+        {
+            struct window_rects fresh_rects, fresh_monitor_rects, fresh_pane_rects;
+            struct ratio dpi = get_dpi_for_window( surface->hwnd );
+            RECT pane = {0};
+
+            if (get_window_rects_authoritative( surface->toplevel, COORDS_PARENT, &fresh_rects, dpi ) &&
+                get_window_rects_authoritative( surface->hwnd, COORDS_CLIENT, &fresh_pane_rects, dpi ))
+            {
+                fresh_monitor_rects = map_window_rects_virt_to_raw( fresh_rects, dpi );
+
+                pane = fresh_pane_rects.client;
+                map_window_points( surface->hwnd, surface->toplevel, (POINT *)&pane, 2, dpi );
+
+                /* same derivation as get_client_surface_rects_ex, on the fresh rects */
+                surface->virtual_rect = pane;
+                client_surface_rects_map( surface->hwnd, dpi, &fresh_rects, &fresh_monitor_rects,
+                                          &surface->virtual_rect, &surface->monitor_rect );
+
+                if (!IsRectEmpty( &fresh_rects.client ) && !IsRectEmpty( &fresh_monitor_rects.client ))
+                {
+                    client_surface_fit_rect( &surface->virtual_rect, &fresh_rects, &fresh_monitor_rects, FALSE, CLIENT_SURFACE_RECT_SLOP );
+                    client_surface_fit_rect( &surface->monitor_rect, &fresh_rects, &fresh_monitor_rects, TRUE, CLIENT_SURFACE_RECT_SLOP );
+                }
+            }
+        }
+    }
 
     TRACE( "updating %s, toplevel %p, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ), surface->toplevel,
            wine_dbgstr_rect( &surface->virtual_rect ), wine_dbgstr_rect( &surface->monitor_rect ) );
