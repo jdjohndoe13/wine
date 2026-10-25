@@ -58,3 +58,8 @@ dlls/win32u/vertical.c generated
 dlls/wineps.drv/direction.c generated
 dlls/wineps.drv/vertical.c generated
 nls/*.nls generated
+
+# fork build scripts: checkout with LF even on Windows (autocrlf=true)
+# so `bash build.sh` works inside containers and on Linux/macOS hosts
+*.sh text eol=lf
+tools/docker/Dockerfile text eol=lf

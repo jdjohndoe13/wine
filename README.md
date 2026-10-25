@@ -1,3 +1,14 @@
+# FORK NOTICE
+
+This repository is a **fork of Wine**. It carries a set of bug fixes on
+top of upstream Wine (see `git log`), and a supported Docker-based
+build. **Read the file [`BUILDING.md`](BUILDING.md) in this directory for
+the fork-specific build instructions** (quick start: pull the pre-built
+build-environment image from GitHub Container Registry and run
+`build.sh`).
+
+The rest of this file is the original upstream Wine README, unchanged.
+
 ## INTRODUCTION
 
 Wine is a program which allows running Microsoft Windows programs
