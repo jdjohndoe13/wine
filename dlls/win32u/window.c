@@ -332,6 +332,34 @@ void detach_client_surfaces( HWND hwnd )
     pthread_mutex_unlock( &surfaces_lock );
 }
 
+/* Track-3: a pane flip hides or re-creates the child pane that hosted a client surface while the
+ * surface itself survives (parked in unused_surfaces, or still attached); when it is recycled or
+ * re-presented afterwards, its content still predates the flip (a frozen webview checkpoint) and
+ * gets replayed until the next real rebuild. Purge at the re-present seam: drop the retained
+ * surfaces so their driver windows are destroyed with the stale checkpoint, and mark the attached
+ * ones so the driver refreshes them instead of replaying stale content on the next present.
+ * Hooked at the client-surface attach point, use_window_client_surface(); the caller must hold
+ * surfaces_lock. */
+static void purge_client_surfaces_locked( HWND hwnd )
+{
+    struct client_surface *surface, *next;
+    HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
+
+    LIST_FOR_EACH_ENTRY_SAFE( surface, next, &client_surfaces, struct client_surface, entry )
+    {
+        if (!surface->hwnd || NtUserGetAncestor( surface->hwnd, GA_ROOT ) != toplevel) continue;
+        WARN( "Track-3 v2: marking client surface %s for refresh on next present\n", debugstr_client_surface( surface ) );
+        surface->updated = TRUE;
+    }
+
+    LIST_FOR_EACH_ENTRY_SAFE( surface, next, &unused_surfaces, struct client_surface, entry )
+    {
+        if (!surface->hwnd || NtUserGetAncestor( surface->hwnd, GA_ROOT ) != toplevel) continue;
+        WARN( "Track-3 v2: dropping retained client surface %s with stale content\n", debugstr_client_surface( surface ) );
+        client_surface_release_locked( surface );
+    }
+}
+
 /* server-fresh copy of the get_window_rects() request body, for callers that suspect the cached
  * client-side rects went stale; pure query, no locking beyond the server request itself */
 static BOOL get_window_rects_authoritative( HWND hwnd, enum coords_relative relative,
@@ -605,6 +633,11 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         WARN( "surface %s has been detached already, ignoring.\n", debugstr_client_surface( surface ) );
     else if (use)
     {
+        /* Track-3: re-attaching a client surface re-presents the content retained in the client
+         * window tree until the next real rebuild; purge the retained surfaces first, so the next
+         * present starts from a fresh layout instead of replaying a stale checkpoint. */
+        purge_client_surfaces_locked( surface->hwnd );
+
         /* surface wasn't used, it shouldn't be in any list */
         list_add_tail( &client_surfaces, &surface->entry );
         client_surface_update_locked( surface );
@@ -3845,7 +3878,14 @@ static BOOL calc_winpos( WINDOWPOS *winpos, struct window_rects *old_rects, stru
     /* Send WM_WINDOWPOSCHANGING message */
     if (!(winpos->flags & SWP_NOSENDCHANGING)
            && !((winpos->flags & SWP_AGG_NOCLIENTCHANGE) && (winpos->flags & SWP_SHOWWINDOW)))
+    {
+        int proposed_cx = winpos->cx, proposed_cy = winpos->cy;  /* Track-3 v3: veto prover */
+
         send_message( winpos->hwnd, WM_WINDOWPOSCHANGING, 0, (LPARAM)winpos );
+        if (proposed_cx != winpos->cx || proposed_cy != winpos->cy)
+            WARN( "Track-3 v3: hwnd %p WM_WINDOWPOSCHANGING rewrote proposed rect -> %dx%d\n",
+                  winpos->hwnd, winpos->cx, winpos->cy );
+    }
 
     if (!(win = get_win_ptr( winpos->hwnd )) ||
         win == WND_OTHER_PROCESS || win == WND_DESKTOP) return FALSE;

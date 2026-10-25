@@ -714,6 +714,9 @@ struct x11drv_win_data
     unsigned long configure_serial;    /* serial of last pending configure request */
     unsigned long net_wm_icon_serial;  /* serial of last pending _NET_WM_ICON request */
     unsigned long state_locks;         /* X11 state requests lock while updating win32 state */
+    RECT config_refused;       /* Track-3 v3: last WM-refused requested config */
+    UINT  config_refuse_count; /* Track-3 v3: repeated-refusal counter (instrument) */
+    UINT  wm_refused : 1;      /* Track-3 v3: delivered config != pending request */
 };
 
 extern struct x11drv_win_data *get_win_data( HWND hwnd );
