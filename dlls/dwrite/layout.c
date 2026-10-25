@@ -4375,12 +4375,247 @@ width_done:
     return S_OK;
 }
 
+/* A dummy zero-length hit test box that follows the text, as returned by HitTestTextPosition()
+   and HitTestTextRange() for position == layout text length. */
+static void layout_hit_test_get_trailing_box(struct dwrite_textlayout *layout,
+        DWRITE_HIT_TEST_METRICS *metrics)
+{
+    struct layout_effective_run *run;
+    struct layout_line *line;
+    UINT8 level;
+
+    run = layout_get_trailing_effective_run(layout);
+    line = LIST_ENTRY(list_tail(&layout->lines), struct layout_line, entry);
+
+    if (!run)
+    {
+        /* Trailing run lookup fails on a layout with no effective runs
+           (e.g. empty text formatted into a single dummy line). Produce a
+           zero-width box past the text, derived from the last line. */
+        metrics->textPosition = layout->length;
+        metrics->length = 0;
+        metrics->left = 0.0f;
+        metrics->width = 0.0f;
+        metrics->top = layout->metrics.height - line->metrics.height;
+        metrics->height = line->metrics.height;
+        metrics->bidiLevel = 0;
+        metrics->isText = TRUE;
+        metrics->isTrimmed = FALSE;
+        return;
+    }
+    level = run->object ? run->bidi_level : run->run->u.regular.run.bidiLevel;
+
+    metrics->textPosition = layout->length;
+    metrics->length = 0;
+    /* Empty box following the last run */
+    metrics->left = run->left + run->align_dx + run->width;
+    metrics->top = layout->metrics.height - line->metrics.height;
+    metrics->width = 0.0f;
+    metrics->height = line->metrics.height;
+    metrics->bidiLevel = level;
+    metrics->isText = run->trimming || !run->object;
+    metrics->isTrimmed = run->trimming;
+}
+
 static HRESULT WINAPI dwritetextlayout_HitTestPoint(IDWriteTextLayout4 *iface,
     FLOAT pointX, FLOAT pointY, BOOL* is_trailinghit, BOOL* is_inside, DWRITE_HIT_TEST_METRICS *metrics)
 {
-    FIXME("%p, %.8e, %.8e, %p, %p, %p): stub\n", iface, pointX, pointY, is_trailinghit, is_inside, metrics);
+    struct dwrite_textlayout *layout = impl_from_IDWriteTextLayout4(iface);
+    struct layout_effective_run *run, *next_run = NULL;
+    struct layout_line *line;
+    DWRITE_HIT_TEST_METRICS box, edge, nl;
+    unsigned int cluster, cursor;
+    float pos_y = 0.0f, band_top = 0.0f, min_left = 0.0f, max_right = 0.0f;
+    bool band_found = false, seen_line_run = false;
+    bool hit = false, trailing = false, edge_set = false, newline_found = false;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("%p, %f, %f, %p, %p, %p.\n", iface, pointX, pointY, is_trailinghit, is_inside, metrics);
+
+    if (FAILED(hr = layout_compute_effective_runs(layout)))
+        return hr;
+
+    /* Vertical line selection: first line whose [top, top + height) band contains pointY.
+       A point above the first band selects the first line, an exhausted walk the last one. */
+    LIST_FOR_EACH_ENTRY(line, &layout->lines, struct layout_line, entry)
+    {
+        if (pointY < pos_y + line->metrics.height)
+        {
+            band_top = pos_y;
+            band_found = true;
+            break;
+        }
+        pos_y += line->metrics.height;
+    }
+    if (!band_found)
+        band_top = pos_y - line->metrics.height;
+
+    /* Horizontal resolution over the bands of the selected line's runs, in logical order. */
+    LIST_FOR_EACH_ENTRY(run, &layout->effective_runs, struct layout_effective_run, entry)
+    {
+        DWRITE_HIT_TEST_METRICS cb;
+        float band_left, band_width, mid;
+        UINT8 level;
+
+        if (run->line != line)
+        {
+            /* Remember the first run on a following line, for the soft-wrapped beyond-band case. */
+            if (seen_line_run && !next_run)
+                next_run = run;
+            continue;
+        }
+        seen_line_run = true;
+
+        if (run->object)
+        {
+            /* An inline object occupies a single visual band spanning the whole run width. */
+            level = run->bidi_level;
+            band_left = run->origin.x + run->align_dx;
+            band_width = run->width;
+
+            cb.textPosition = run->start_position;
+            cb.length = run->length;
+            cb.left = band_left;
+            cb.top = run->origin.y - run->line->baseline;
+            cb.width = band_width;
+            cb.height = 0.0f;
+            cb.bidiLevel = level;
+            cb.isText = run->trimming;
+            cb.isTrimmed = run->trimming;
+        }
+        else
+        {
+            float run_left, run_right, cum_width = 0.0f;
+
+            level = run->run->u.regular.run.bidiLevel;
+            run_left = run->left + run->align_dx;
+            run_right = run_left + run->width;
+            cursor = run->start_position;
+
+            for (cluster = run->first_cluster; cluster < layout->cluster_count &&
+                    cursor < run->start_position + run->length; ++cluster)
+            {
+                band_width = layout->clustermetrics[cluster].width;
+                band_left = run_left + cum_width;
+                if (level & 1)
+                    band_left = run_right - (cum_width + band_width);
+
+                cb.textPosition = cursor;
+                cb.length = layout->clustermetrics[cluster].length;
+                cb.left = band_left;
+                cb.top = run->origin.y - run->line->baseline;
+                cb.width = band_width;
+                cb.height = run->line->height;
+                cb.bidiLevel = level;
+                cb.isText = TRUE;
+                cb.isTrimmed = run->trimming;
+
+                cursor += layout->clustermetrics[cluster].length;
+                cum_width += band_width;
+
+                if (layout->clustermetrics[cluster].isNewline)
+                {
+                    nl = cb;
+                    newline_found = true;
+                }
+
+                if (!edge_set || band_left < min_left)
+                {
+                    min_left = band_left;
+                    edge = cb;
+                    edge_set = true;
+                }
+                if (band_left + band_width > max_right)
+                    max_right = band_left + band_width;
+
+                if (!hit && band_left <= pointX && pointX < band_left + band_width)
+                {
+                    hit = true;
+                    box = cb;
+                    mid = band_left + band_width * 0.5f;
+                    trailing = (level & 1) ? pointX < mid : pointX >= mid;
+                }
+            }
+            continue;
+        }
+
+        if (!edge_set || band_left < min_left)
+        {
+            min_left = band_left;
+            edge = cb;
+            edge_set = true;
+        }
+        if (band_left + band_width > max_right)
+            max_right = band_left + band_width;
+
+        if (!hit && band_left <= pointX && pointX < band_left + band_width)
+        {
+            hit = true;
+            box = cb;
+            mid = band_left + band_width * 0.5f;
+            trailing = (level & 1) ? pointX < mid : pointX >= mid;
+        }
+    }
+
+    /* Local behavior for a point beyond the line's text bands or in an empty
+       layout, not evidenced by native tests: a point left of the leading band
+       edge reports the leading edge cluster; beyond the last band of the last
+       line reports the layout end box like HitTestTextPosition() at the length;
+       beyond the last band of a terminated line reports its newline cluster;
+       a soft-wrapped line reports the position wrapped to on the next line;
+       a line with no runs at all reports the trailing box of the layout. */
+    *is_inside = FALSE;
+
+    if (hit)
+    {
+        *metrics = box;
+        *is_trailinghit = !!trailing;
+        *is_inside = pointY >= band_top && pointY < band_top + line->metrics.height ? TRUE : FALSE;
+    }
+    else if (edge_set && pointX < min_left)
+    {
+        /* Left of the line's leading band edge. */
+        *metrics = edge;
+        *is_trailinghit = FALSE;
+    }
+    else if (edge_set)
+    {
+        if (line == LIST_ENTRY(list_tail(&layout->lines), struct layout_line, entry))
+        {
+            layout_hit_test_get_trailing_box(layout, metrics);
+            *is_trailinghit = FALSE;
+        }
+        else if (newline_found)
+        {
+            /* Beyond the last band of a terminated line: its newline cluster position. */
+            *metrics = nl;
+            *is_trailinghit = FALSE;
+        }
+        else
+        {
+            /* A soft-wrapped line has no newline cluster on it, the position wrapped to
+               on the following line is reported as a zero-width box. */
+            metrics->textPosition = next_run->start_position;
+            metrics->length = 0;
+            metrics->left = max_right;
+            metrics->top = next_run->origin.y - next_run->line->baseline;
+            metrics->width = 0.0f;
+            metrics->height = next_run->line->height;
+            metrics->bidiLevel = next_run->bidi_level;
+            metrics->isText = TRUE;
+            metrics->isTrimmed = FALSE;
+            *is_trailinghit = FALSE;
+        }
+    }
+    else
+    {
+        /* The selected line has no effective runs at all (an empty layout's dummy
+           line, or a line wrapped to trailing whitespace only). */
+        layout_hit_test_get_trailing_box(layout, metrics);
+        *is_trailinghit = FALSE;
+    }
+
+    return S_OK;
 }
 
 static struct layout_effective_run *layout_get_effective_run_for_position(struct dwrite_textlayout *layout,
@@ -4414,22 +4649,7 @@ static HRESULT WINAPI dwritetextlayout_HitTestTextPosition(IDWriteTextLayout4 *i
 
     if (position == layout->length)
     {
-        struct layout_line *line = LIST_ENTRY(list_tail(&layout->lines), struct layout_line, entry);
-        UINT8 level;
-
-        run = layout_get_trailing_effective_run(layout);
-        level = run->object ? run->bidi_level : run->run->u.regular.run.bidiLevel;
-
-        metrics->textPosition = position;
-        metrics->length = 0;
-        /* Empty box following the last run */
-        metrics->left = run->left + run->align_dx + run->width;
-        metrics->top = layout->metrics.height - line->metrics.height;
-        metrics->width = 0.0f;
-        metrics->height = line->metrics.height;
-        metrics->bidiLevel = level;
-        metrics->isText = run->trimming || !run->object;
-        metrics->isTrimmed = run->trimming;
+        layout_hit_test_get_trailing_box(layout, metrics);
 
         *point_x = metrics->left;
         *point_y = metrics->top;
@@ -4494,14 +4714,163 @@ static HRESULT WINAPI dwritetextlayout_HitTestTextPosition(IDWriteTextLayout4 *i
     return S_OK;
 }
 
+static void layout_hit_test_flush_box(DWRITE_HIT_TEST_METRICS *metrics, UINT32 max_metricscount,
+        UINT32 *total, FLOAT origin_x, FLOAT origin_y, const DWRITE_HIT_TEST_METRICS *box)
+{
+    (*total)++;
+    if (metrics && *total <= max_metricscount)
+    {
+        metrics[*total - 1] = *box;
+        metrics[*total - 1].left += origin_x;
+        metrics[*total - 1].top += origin_y;
+    }
+}
+
 static HRESULT WINAPI dwritetextlayout_HitTestTextRange(IDWriteTextLayout4 *iface,
     UINT32 textPosition, UINT32 textLength, FLOAT originX, FLOAT originY,
     DWRITE_HIT_TEST_METRICS *metrics, UINT32 max_metricscount, UINT32* actual_metricscount)
 {
-    FIXME("%p, %u, %u, %f, %f, %p, %u, %p): stub\n", iface, textPosition, textLength, originX, originY, metrics,
+    struct dwrite_textlayout *layout = impl_from_IDWriteTextLayout4(iface);
+    struct layout_effective_run *box_run = NULL;
+    struct layout_effective_run *run;
+    DWRITE_HIT_TEST_METRICS box;
+    UINT32 start, end, total = 0;
+    bool box_open = false;
+    HRESULT hr;
+
+    TRACE("%p, %u, %u, %f, %f, %p, %u, %p.\n", iface, textPosition, textLength, originX, originY, metrics,
         max_metricscount, actual_metricscount);
 
-    return E_NOTIMPL;
+    if (FAILED(hr = layout_compute_effective_runs(layout)))
+        return hr;
+
+    start = min(textPosition, layout->length);
+
+    if (start == layout->length)
+    {
+        /* Trailing position is reported as a single dummy box, same as in HitTestTextPosition(). */
+        layout_hit_test_get_trailing_box(layout, &box);
+        layout_hit_test_flush_box(metrics, max_metricscount, &total, originX, originY, &box);
+
+        *actual_metricscount = total;
+        return max_metricscount >= 1 ? S_OK : E_NOT_SUFFICIENT_BUFFER;
+    }
+
+    end = start + min(textLength, layout->length - start);
+
+    LIST_FOR_EACH_ENTRY(run, &layout->effective_runs, struct layout_effective_run, entry)
+    {
+        UINT32 seg_from, seg_to;
+        UINT8 level;
+        unsigned int cluster, cursor, cluster0, seg_pos;
+        UINT32 seg_len = 0;
+        float seg_width = 0.0f;
+
+        if (run->start_position + run->length <= start)
+            continue;
+        if (run->start_position >= end)
+            break;
+
+        if (run->object)
+        {
+            /* As in HitTestTextPosition(), an inline object is reported as a single
+               whole-run box, and object boxes are never merged into adjacent boxes. */
+            if (box_open)
+            {
+                layout_hit_test_flush_box(metrics, max_metricscount, &total, originX, originY, &box);
+                box_open = false;
+            }
+
+            box.textPosition = run->start_position;
+            box.length = run->length;
+            box.left = run->origin.x + run->align_dx;
+            box.top = run->origin.y - run->line->baseline;
+            box.width = run->width;
+            box.height = 0.0f;
+            box.bidiLevel = run->bidi_level;
+            box.isText = run->trimming;
+            box.isTrimmed = run->trimming;
+            layout_hit_test_flush_box(metrics, max_metricscount, &total, originX, originY, &box);
+            continue;
+        }
+
+        level = run->run->u.regular.run.bidiLevel;
+        seg_from = max(run->start_position, start);
+        seg_to = min(run->start_position + run->length, end);
+
+        cluster = run->first_cluster;
+        cursor = run->start_position;
+
+        /* Skip clusters fully located before the requested range. */
+        while (cursor < seg_to && cluster < layout->cluster_count &&
+                cursor + layout->clustermetrics[cluster].length <= seg_from)
+        {
+            cursor += layout->clustermetrics[cluster].length;
+            cluster++;
+        }
+
+        if (cursor >= seg_to || cluster >= layout->cluster_count)
+            continue;
+
+        /* In-range clusters are reported fully, without splitting a cluster in the middle. */
+        cluster0 = cluster;
+        seg_pos = cursor;
+        while (cursor < seg_to && cluster < layout->cluster_count)
+        {
+            seg_len += layout->clustermetrics[cluster].length;
+            seg_width += layout->clustermetrics[cluster].width;
+            cursor += layout->clustermetrics[cluster].length;
+            cluster++;
+        }
+
+        /* A zero-width newline cluster is not given a separate box, it extends the line
+           box it ends. Otherwise a new box is started when the run belongs to a different
+           line, or bidi level or trimming flags differ. */
+        if (box_open && run->line == box_run->line && level == box.bidiLevel &&
+                !!run->trimming == !!box.isTrimmed)
+        {
+            box.length += seg_len;
+            box.width += seg_width;
+            if (level & 1)
+            {
+                /* In RTL a later logical run is visually placed to the left of the box. */
+                float seg_left = run->left + run->align_dx + run->width
+                    - get_cluster_range_width(layout, run->first_cluster, cluster);
+
+                box.left = min(box.left, seg_left);
+            }
+        }
+        else
+        {
+            if (box_open)
+                layout_hit_test_flush_box(metrics, max_metricscount, &total, originX, originY, &box);
+
+            box.textPosition = seg_pos;
+            box.length = seg_len;
+            box.left = run->left + run->align_dx;
+            if (level & 1)
+            {
+                box.left += run->width;
+                box.left -= get_cluster_range_width(layout, run->first_cluster, cluster);
+            }
+            else
+                box.left += get_cluster_range_width(layout, run->first_cluster, cluster0);
+            box.width = seg_width;
+            box.top = run->origin.y - run->line->baseline;
+            box.height = run->line->height;
+            box.bidiLevel = level;
+            box.isText = TRUE;
+            box.isTrimmed = run->trimming;
+            box_run = run;
+            box_open = true;
+        }
+    }
+
+    if (box_open)
+        layout_hit_test_flush_box(metrics, max_metricscount, &total, originX, originY, &box);
+
+    *actual_metricscount = total;
+    return max_metricscount >= total ? S_OK : E_NOT_SUFFICIENT_BUFFER;
 }
 
 static HRESULT WINAPI dwritetextlayout1_SetPairKerning(IDWriteTextLayout4 *iface, BOOL is_pairkerning_enabled,
