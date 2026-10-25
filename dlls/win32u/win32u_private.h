@@ -202,6 +202,7 @@ extern BOOL update_display_cache( BOOL force );
 extern void reset_monitor_update_serial(void);
 extern void user_lock(void);
 extern void user_unlock(void);
+extern BOOL user_is_locked(void);
 extern void user_check_not_lock(void);
 extern BOOL get_gpu_uuid_from_luid( const LUID *luid, GUID *uuid );
 extern BOOL get_gpu_info_from_uuid( const GUID *uuid, LUID *luid, UINT32 *node_mask, char *name );
@@ -313,6 +314,8 @@ extern BOOL get_window_rect_rel( HWND hwnd, enum coords_relative rel, RECT *rect
 extern BOOL get_client_rect_rel( HWND hwnd, enum coords_relative rel, RECT *rect, struct ratio dpi );
 extern BOOL get_window_rects( HWND hwnd, enum coords_relative relative,
                               struct window_rects *rects, struct ratio dpi );
+extern void ws_w7_arm_client_surface( HWND hwnd );
+extern void ws_w7_flush_client_surface_present( void );
 extern HWND *list_window_children( HWND hwnd );
 extern int map_window_points( HWND hwnd_from, HWND hwnd_to, POINT *points, UINT count,
                               struct ratio dpi );

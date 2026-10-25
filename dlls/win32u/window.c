@@ -576,6 +576,18 @@ void client_surface_present( struct client_surface *surface )
     HWND hwnd;
 
     pthread_mutex_lock( &surfaces_lock );
+
+    /* WS: presentq row: WARN-only instrument, no behavior change */
+    {
+        static DWORD ws_last_presentq;
+        DWORD ws_now = NtGetTickCount();
+        if (ws_now - ws_last_presentq > 1000)
+        {
+            ws_last_presentq = ws_now;
+            WARN( "WS: presentq hwnd %p surface %p\n", surface->hwnd, surface );
+        }
+    }
+
     if ((hwnd = surface->hwnd))
     {
         client_surface_update_locked( surface );
@@ -724,6 +736,104 @@ static struct client_surface *ws_find_attached_surface_subtree( HWND hwnd, UINT 
         free( list );
     }
     return NULL;
+}
+
+/* W7 white-out fix (dce-release hook): a child window that renders via a client surface has no
+ * own win32u window surface (win->surface is NULL — children use the parent surface — or the
+ * dummy one); when its DCE is released (the paint is done), the parent composition may still hold
+ * stale content over the child rect. Arm a deferred client-surface present: release_dce() runs
+ * with the user lock held and inside dce_list iteration, so the present cannot run there —
+ * client_surface_present() takes surfaces_lock and then the user lock (via NtUserGetAncestor /
+ * get_win_ptr), the reverse order would be an ABBA deadlock against the established
+ * surfaces_lock -> user_lock order, and a present in the middle of a dce_list walk would
+ * re-enter DC code. The arm only records the hwnd (pending slot, own lock); the present runs at
+ * the next DCE release / ReleaseDC outside the user lock, where the surfaces_lock -> user_lock
+ * order is the established one. The park path (use_window_client_surface) keeps the hwnd on the
+ * unused-list entry, so a parked surface can still be matched by hwnd. */
+static pthread_mutex_t ws_w7_pending_lock = PTHREAD_MUTEX_INITIALIZER;
+static HWND ws_w7_pending_hwnd;
+static LONG ws_w7_in_flush;
+
+void ws_w7_arm_client_surface( HWND hwnd )
+{
+    WND *win;
+
+    if (ws_w7_in_flush) return; /* re-entrant arm from the present itself, skip */
+
+    /* the released window must not own a real window surface: it renders via a client surface */
+    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
+    if (win->surface && win->surface != &dummy_surface)
+    {
+        release_win_ptr( win );
+        return;
+    }
+    release_win_ptr( win );
+
+    pthread_mutex_lock( &ws_w7_pending_lock );
+    if (!ws_w7_pending_hwnd) ws_w7_pending_hwnd = hwnd;
+    pthread_mutex_unlock( &ws_w7_pending_lock );
+}
+
+void ws_w7_flush_client_surface_present( void )
+{
+    struct client_surface *surface = NULL;
+    UINT parked = 0;
+    HWND hwnd;
+
+    if (InterlockedCompareExchange( &ws_w7_in_flush, 1, 0 )) return; /* already flushing */
+
+    /* the flush must run outside the user lock: client_surface_present() takes surfaces_lock
+     * and then the user lock (via NtUserGetAncestor / get_win_ptr); running it while the user
+     * lock is held would be the reverse (user -> surfaces) order, i.e. ABBA */
+    if (user_is_locked())
+    {
+        InterlockedExchange( &ws_w7_in_flush, 0 );
+        return;
+    }
+
+    pthread_mutex_lock( &ws_w7_pending_lock );
+    hwnd = ws_w7_pending_hwnd;
+    ws_w7_pending_hwnd = 0;
+    pthread_mutex_unlock( &ws_w7_pending_lock );
+
+    if (!hwnd)
+    {
+        InterlockedExchange( &ws_w7_in_flush, 0 );
+        return;
+    }
+
+    /* find the client surface for the window: the attached list first, then the parked
+     * (unused) list; the park path keeps the hwnd, so a parked entry can still be matched */
+    pthread_mutex_lock( &surfaces_lock );
+    LIST_FOR_EACH_ENTRY( surface, &client_surfaces, struct client_surface, entry )
+        if (surface->hwnd == hwnd) break;
+    if (&surface->entry != &client_surfaces) parked = 0;
+    else
+    {
+        LIST_FOR_EACH_ENTRY( surface, &unused_surfaces, struct client_surface, entry )
+            if (surface->hwnd == hwnd) break;
+        if (&surface->entry != &unused_surfaces) parked = 1;
+        else surface = NULL;
+    }
+
+    /* throttle: only present when the surface is flagged updated (geometry changed or the
+     * Track-3 purge marked it); the flag is not consumed here — opengl get_size owns it */
+    if (surface && !surface->updated)
+    {
+        surface = NULL;
+    }
+    else if (surface) client_surface_add_ref( surface );
+
+    pthread_mutex_unlock( &surfaces_lock );
+
+    if (surface)
+    {
+        WARN( "WS: present-nil hwnd %p parked %u\n", hwnd, parked );
+        client_surface_present( surface );
+        client_surface_release( surface );
+    }
+
+    InterlockedExchange( &ws_w7_in_flush, 0 );
 }
 
 /* W5 white-out fix (style-path show hook): the app's visibility flips ride SetWindowLong /

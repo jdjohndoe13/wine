@@ -578,6 +578,9 @@ struct window_surface *window_surface_create( const struct window_surface_funcs 
 
     memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
 
+    WARN( "WS: fresh surface %p hwnd %p rect %s color_bitmap %p white-filled\n", surface, surface->hwnd,
+          wine_dbgstr_rect( &surface->rect ), surface->color_bitmap );
+
     TRACE( "created surface %p for hwnd %p rect %s\n", surface, hwnd, wine_dbgstr_rect( &surface->rect ) );
     return surface;
 }
@@ -613,6 +616,12 @@ void window_surface_unlock( struct window_surface *surface )
     pthread_mutex_unlock( &surface->mutex );
 }
 
+/* W2 instrumentation: big-surface probe helper, no behavior change */
+static BOOL ws_probe_big( const struct window_surface *surface )
+{
+    return surface && surface->rect.right - surface->rect.left >= 300 && surface->rect.bottom - surface->rect.top >= 200;
+}
+
 void window_surface_flush( struct window_surface *surface )
 {
     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -643,6 +652,62 @@ void window_surface_flush( struct window_surface *surface )
         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
                                    shape_changed, shape_info, shape_bits ))
             reset_bounds( &surface->bounds );
+
+        if (ws_probe_big( surface ) && color_info->bmiHeader.biBitCount == 32)
+        {
+            UINT bpr    = ((UINT)color_info->bmiHeader.biWidth * 4 + 3) & ~3;
+            UINT height = (UINT)abs( color_info->bmiHeader.biHeight );
+            UINT w      = dirty.right > dirty.left ? dirty.right - dirty.left : 1;
+            UINT ys[3]  = { (UINT)max( 0, dirty.top ), ((UINT)dirty.top + (UINT)dirty.bottom) / 2,
+                            (UINT)max( 0, dirty.bottom - 1 ) };
+            UINT white[3] = {0}, white_m[3] = {0}, probes[3] = {0}, k, i;
+            DWORD vals[2];
+            const DWORD *row;
+            UINT y;
+
+            for (k = 0; k < 3; k++)
+            {
+                y = ys[k] < height ? ys[k] : (height ? height - 1 : 0);
+                row = (const DWORD *)((const BYTE *)color_bits + (size_t)y * bpr);
+                for (i = 0; i < 12; i++)
+                {
+                    UINT x = dirty.left + (UINT)((LONGLONG)w * i / 12);
+                    if (x < (UINT)color_info->bmiHeader.biWidth)
+                    {
+                        DWORD px = row[x];
+                        if ((px & 0x00ffffff) == 0x00ffffff) white[k]++;
+                        probes[k]++;
+                    }
+                }
+            }
+            /* mirrored rows: if the DIB is bottom-up (biHeight > 0 in wine's DIBSection),
+               the v1 samples read one fixed row; this variant samples height-1-y too */
+            for (k = 0; k < 3; k++)
+            {
+                UINT ym = height ? height - 1 - ys[k] : 0;
+                if (ym >= height) ym = 0;
+                row = (const DWORD *)((const BYTE *)color_bits + (size_t)ym * bpr);
+                for (i = 0; i < 12; i++)
+                {
+                    UINT x = dirty.left + (UINT)((LONGLONG)w * i / 12);
+                    if (x < (UINT)color_info->bmiHeader.biWidth)
+                    {
+                        DWORD px = row[x];
+                        if ((px & 0x00ffffff) == 0x00ffffff) white_m[k]++;
+                    }
+                }
+            }
+            {
+                UINT ymid = ((UINT)dirty.top + (UINT)dirty.bottom) / 2;
+                const DWORD *rmid = (const DWORD *)((const BYTE *)color_bits + (size_t)ymid * bpr);
+                vals[0] = rmid[ dirty.left % (UINT)color_info->bmiHeader.biWidth ];
+                vals[1] = rmid[ (dirty.left + w/2) % (UINT)color_info->bmiHeader.biWidth ];
+            }
+            WARN( "WS: flush2 hwnd %p bitmap %p dirty %s top %u/12 mid %u/12 bot %u/12 mirror %u %u %u vals %08x %08x\n",
+                  surface->hwnd, surface->color_bitmap, wine_dbgstr_rect( &dirty ),
+                  white[0], probes[0], white[1], probes[1], white[2], probes[2],
+                  white_m[0], white_m[1], white_m[2], vals[0], vals[1] );
+        }
     }
 
     window_surface_unlock( surface );
@@ -761,6 +826,17 @@ void flush_window_surfaces( BOOL idle )
 
     pthread_mutex_lock( &surfaces_lock );
     now = NtGetTickCount();
+
+    /* WS: idleflush row: WARN-only instrument, no behavior change */
+    {
+        static DWORD ws_last_idleflush;
+        if (now - ws_last_idleflush > 2000)
+        {
+            ws_last_idleflush = now;
+            WARN( "WS: idleflush n_surfaces %u\n", list_count( &window_surfaces ) );
+        }
+    }
+
     if (idle) last_idle = now;
     /* if not idle, we only flush if there's evidence that the app never goes idle */
     else if ((int)(now - last_idle) < 50) goto done;
@@ -827,6 +903,11 @@ static void update_visible_region( struct dce *dce )
     RECT win_rect, top_rect;
     WND *win;
 
+    /* WS: vis instrument-only locals (no behavior change) */
+    UINT server_n = 0;
+    RECT vis_box;
+    INT vis_type;
+
     /* don't clip siblings if using parent clip region */
     if (flags & DCX_PARENTCLIP) flags &= ~DCX_CLIPSIBLINGS;
 
@@ -848,6 +929,7 @@ static void update_visible_region( struct dce *dce )
                 data->rdh.iType    = RDH_RECTANGLES;
                 data->rdh.nCount   = reply_size / sizeof(RECT);
                 data->rdh.nRgnSize = reply_size;
+                server_n = data->rdh.nCount;   /* WS: vis instrument-only capture */
                 vis_rgn = NtGdiExtCreateRegion( NULL, data->rdh.dwSize + data->rdh.nRgnSize, data );
                 top_win     = wine_server_ptr_handle( reply->top_win );
                 win_rect    = wine_server_get_rect( reply->win_rect );
@@ -880,6 +962,31 @@ static void update_visible_region( struct dce *dce )
     }
 
     if (!surface) SetRectEmpty( &top_rect );
+
+    /* WS: vis row: WARN-only instrument, no behavior change */
+    vis_type = NtGdiGetRgnBox( vis_rgn, &vis_box );
+    if ((dce->flags & DCX_CLIPCHILDREN) && vis_type != ERROR &&
+        vis_box.right - vis_box.left >= 300 && vis_box.bottom - vis_box.top >= 200)
+    {
+        WARN( "WS: vis hwnd %p dce_flags %08x server_n %u rgn %s box %s win_rect %s top_win %p surface %p\n",
+              dce->hwnd, dce->flags, server_n, wine_dbg_sprintf( "type %d", vis_type ),
+              wine_dbgstr_rect( &vis_box ), wine_dbgstr_rect( &win_rect ), top_win, surface );
+    }
+
+    /* WS: visall row: WARN-only instrument, no behavior change. Same big-rect gate as the
+     * 'WS: vis' row but unconditional (no DCX_CLIPCHILDREN gate). */
+    if (vis_type != ERROR &&
+        vis_box.right - vis_box.left >= 300 && vis_box.bottom - vis_box.top >= 200)
+    {
+        WARN( "WS: visall hwnd %p dce_flags %08x box %s\n",
+              dce->hwnd, dce->flags, wine_dbgstr_rect( &vis_box ) );
+    }
+
+    /* W6 white-out fix REVERTED (oracle round 6): cross-process wall — the client_surfaces list
+     * is per-process; the canvas child's surface lives in the msedge process, the whitening in
+     * the Dr.Explain process, so the parent-side exclusion could never see the surface.
+     * Replaced by the W7 child-side present hook (see release_dce / ws_w7_flush below). */
+
     set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface );
     if (surface) window_surface_release( surface );
 }
@@ -889,7 +996,9 @@ static void update_visible_region( struct dce *dce )
  */
 static void release_dce( struct dce *dce )
 {
-    if (!dce->hwnd) return;  /* already released */
+    HWND hwnd = dce->hwnd;
+
+    if (!hwnd) return;  /* already released */
 
     set_visible_region( dce->hdc, 0, &dummy_surface.rect, &dummy_surface.rect, &dummy_surface );
     user_driver->pReleaseDC( dce->hwnd, dce->hdc );
@@ -898,6 +1007,11 @@ static void release_dce( struct dce *dce )
     dce->clip_rgn = 0;
     dce->hwnd     = 0;
     dce->flags   &= DCX_CACHE;
+
+    /* W7: arm the deferred client-surface present for this window (the present itself must not
+     * run here — we are under the user lock and inside dce_list iteration; see the W7 comment
+     * in window.c). The arm only records the hwnd when the window has no real window surface. */
+    ws_w7_arm_client_surface( hwnd );
 }
 
 /***********************************************************************
@@ -1123,6 +1237,9 @@ void free_dce( struct dce *dce, HWND hwnd, struct list *drawables )
         NtGdiDeleteObjectApp( dce_to_free->hdc );
         free( dce_to_free );
     }
+
+    /* W7: run the deferred client-surface present armed by the release_dce calls above */
+    ws_w7_flush_client_surface_present();
 }
 
 BOOL is_cache_dc( HDC hdc )
@@ -1251,6 +1368,11 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
         ret = TRUE;
     }
     user_unlock();
+
+    /* W7: run the deferred client-surface present armed by release_dce (we are outside the
+     * user lock here; client_surface_present takes surfaces_lock -> user_lock, the order the
+     * existing attach/show hooks already use). */
+    ws_w7_flush_client_surface_present();
 
     release_opengl_drawables( &drawables );
     return ret;
@@ -1715,9 +1837,76 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
     RECT rect;
     UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_NOCHILDREN;
 
+    /* WS: bp instrument-only locals (no behavior change) */
+    DWORD bp_style;
+    INT bp_type;
+    UINT bp_nvis, bp_ninbox, bp_nsib;
+    int bp_i;
+    LONG bp_area, bp_best;
+    HWND bp_parent, bp_max_child, *bp_list;
+    RECT bp_box, bp_max, bp_child, bp_dummy;
+    struct window_rects bp_rects;
+
     NtUserHideCaret( hwnd );
 
     if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) return 0;
+
+    /* WS: bp row: WARN-only instrument, no behavior change. hrgn from send_ncpaint is in screen coords. */
+    bp_style = get_window_long( hwnd, GWL_STYLE );
+    bp_type = NtGdiGetRgnBox( hrgn, &bp_box );
+    if ((bp_style & WS_CLIPCHILDREN) &&
+        (bp_type == SIMPLEREGION || bp_type == COMPLEXREGION) &&
+        !IsRectEmpty( &bp_box ) &&
+        bp_box.right - bp_box.left >= 300 &&
+        bp_box.bottom - bp_box.top >= 200)
+    {
+        bp_nvis = bp_ninbox = bp_nsib = 0;
+        bp_best = 0;
+        bp_max_child = 0;
+        SetRectEmpty( &bp_max );
+
+        bp_list = list_window_children( hwnd );
+        if (bp_list)
+        {
+            for (bp_i = 0; bp_list[bp_i]; bp_i++)
+            {
+                if (!(get_window_long( bp_list[bp_i], GWL_STYLE ) & WS_VISIBLE)) continue;
+                get_window_rects( bp_list[bp_i], COORDS_SCREEN, &bp_rects, get_thread_dpi() );
+                bp_child = bp_rects.window;
+                if (!intersect_rect( &bp_dummy, &bp_child, &bp_box )) continue;
+                bp_nvis++;
+                bp_area = (LONG)(bp_child.right - bp_child.left) * (LONG)(bp_child.bottom - bp_child.top);
+                if (bp_area > bp_best)
+                {
+                    bp_best = bp_area;
+                    bp_max_child = bp_list[bp_i];
+                    bp_max = bp_child;
+                }
+                if (EqualRect( &bp_dummy, &bp_child )) bp_ninbox++;
+            }
+            free( bp_list );
+        }
+
+        bp_parent = NtUserGetAncestor( hwnd, GA_PARENT );
+        bp_list = bp_parent ? list_window_children( bp_parent ) : NULL;
+        if (bp_list)
+        {
+            for (bp_i = 0; bp_list[bp_i]; bp_i++)
+            {
+                if (bp_list[bp_i] == hwnd) continue;
+                if (!(get_window_long( bp_list[bp_i], GWL_STYLE ) & WS_VISIBLE)) continue;
+                get_window_rects( bp_list[bp_i], COORDS_SCREEN, &bp_rects, get_thread_dpi() );
+                bp_child = bp_rects.window;
+                if (!intersect_rect( &bp_dummy, &bp_child, &bp_box )) continue;
+                bp_nsib++;
+            }
+            free( bp_list );
+        }
+
+        WARN( "WS: bp hwnd %p style %08x rgn %s box %s flags %08x n_vis %u n_inbox %u max_child hwnd %p rect %s n_sib %u\n",
+              hwnd, bp_style, wine_dbg_sprintf( "type %d", bp_type ), wine_dbgstr_rect( &bp_box ),
+              flags, bp_nvis, bp_ninbox, bp_max_child, wine_dbgstr_rect( &bp_max ), bp_nsib );
+    }
 
     erase = send_erase( hwnd, flags, hrgn, &rect, &hdc );
 
