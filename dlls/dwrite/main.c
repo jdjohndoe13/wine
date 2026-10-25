@@ -635,10 +635,19 @@ static void release_fontface_cache(struct list *fontfaces)
     }
 }
 
-static void release_fileloader(struct fileloader *fileloader)
+static void release_fileloader(struct dwritefactory *factory, struct fileloader *fileloader)
 {
+    /* The loader's cached face slots are detached under the factory critical section, the
+       same section face resolution routes hold while searching the slots for an already
+       built family face: an unlocked detach would leave a route iterating a dead list of
+       wrappers, handing the dead carrier out at resolution time. */
+    factory_lock(&factory->IDWriteFactory7_iface);
     list_remove(&fileloader->entry);
     release_fontface_cache(&fileloader->fontfaces);
+    factory_unlock(&factory->IDWriteFactory7_iface);
+
+    /* The loader instance itself is released outside the section: some loader instances
+       release back into the factory. */
     IDWriteFontFileLoader_Release(fileloader->loader);
     free(fileloader);
 }
@@ -669,7 +678,7 @@ static void release_dwritefactory(struct dwritefactory *factory)
     }
 
     LIST_FOR_EACH_ENTRY_SAFE(fileloader, fileloader2, &factory->file_loaders, struct fileloader, entry)
-        release_fileloader(fileloader);
+        release_fileloader(factory, fileloader);
 
     for (i = 0; i < ARRAY_SIZE(factory->system_collections); ++i)
     {
@@ -724,10 +733,38 @@ static struct collectionloader *factory_get_collection_loader(struct dwritefacto
     return found;
 }
 
+/* Fetch a collection from a cached slot: the slot may be cleared concurrently
+   (factory_detach_fontcollection(), factory teardown), so read it atomically, pin the
+   instance, and verify the slot still holds that same instance before handing it out. */
+static IDWriteFontCollection *factory_fetch_cached_slot(IDWriteFontCollection3 **slot)
+{
+    IDWriteFontCollection3 *instance;
+
+    if (!(instance = InterlockedCompareExchangePointer((void **)slot, NULL, NULL)))
+        return NULL;
+
+    IDWriteFontCollection3_AddRef(instance);
+
+    if (InterlockedCompareExchangePointer((void **)slot, instance, instance) == instance)
+        return (IDWriteFontCollection *)instance;
+
+    /* The instance was detached concurrently; the pin just taken keeps it alive
+       while the reference is dropped. */
+    IDWriteFontCollection3_Release(instance);
+    return NULL;
+}
+
+static IDWriteFontCollection *factory_fetch_cached_collection(struct dwritefactory *factory,
+        DWRITE_FONT_FAMILY_MODEL family_model)
+{
+    return factory_fetch_cached_slot(&factory->system_collections[family_model]);
+}
+
 static HRESULT factory_get_system_collection(struct dwritefactory *factory,
         DWRITE_FONT_FAMILY_MODEL family_model, REFIID riid, void **out)
 {
     IDWriteFontCollection *collection;
+    unsigned int attempt;
     HRESULT hr;
 
     *out = NULL;
@@ -735,24 +772,33 @@ static HRESULT factory_get_system_collection(struct dwritefactory *factory,
     if (family_model != DWRITE_FONT_FAMILY_MODEL_TYPOGRAPHIC &&
             family_model != DWRITE_FONT_FAMILY_MODEL_WEIGHT_STRETCH_STYLE)
     {
+        TRACE("NULLREPLY: GetSystemFontCollection invalid model %d.\n", family_model);
         return E_INVALIDARG;
     }
 
-    if (factory->system_collections[family_model])
-        return IDWriteFontCollection_QueryInterface(factory->system_collections[family_model], riid, out);
-
-    if (FAILED(hr = get_system_fontcollection(&factory->IDWriteFactory7_iface, family_model, &collection)))
+    /* Two attempts: a freshly stored cache entry can still be detached before the handout. */
+    for (attempt = 0; attempt < 2; ++attempt)
     {
-        WARN("Failed to create system font collection, hr %#lx.\n", hr);
-        return hr;
+        if ((collection = factory_fetch_cached_collection(factory, family_model)))
+        {
+            hr = IDWriteFontCollection_QueryInterface(collection, riid, out);
+            IDWriteFontCollection_Release(collection);
+            return hr;
+        }
+
+        if (FAILED(hr = get_system_fontcollection(&factory->IDWriteFactory7_iface, family_model, &collection)))
+        {
+            WARN("Failed to create system font collection, hr %#lx.\n", hr);
+            TRACE("NULLREPLY: GetSystemFontCollection failed model=%d hr=0x%08x.\n", family_model, hr);
+            return hr;
+        }
+
+        if (InterlockedCompareExchangePointer((void **)&factory->system_collections[family_model], collection, NULL))
+            IDWriteFontCollection_Release(collection);
     }
 
-    if (InterlockedCompareExchangePointer((void **)&factory->system_collections[family_model], collection, NULL))
-        IDWriteFontCollection_Release(collection);
-
-    hr = IDWriteFontCollection_QueryInterface(factory->system_collections[family_model], riid, out);
-    IDWriteFontCollection_Release(factory->system_collections[family_model]);
-    return hr;
+    TRACE("NULLREPLY: GetSystemFontCollection cache slot detached twice.\n");
+    return E_FAIL;
 }
 
 static HRESULT WINAPI dwritefactory_QueryInterface(IDWriteFactory7 *iface, REFIID riid, void **obj)
@@ -906,10 +952,16 @@ static HRESULT WINAPI dwritefactory_CreateFontFileReference(IDWriteFactory7 *ifa
     /* Get a reference key in local file loader format. */
     hr = get_local_refkey(path, writetime, &key, &key_size);
     if (FAILED(hr))
+    {
+        TRACE("NULLREPLY: CreateFontFileReference refkey failed path=%s hr=0x%08x.\n", debugstr_w(path), hr);
         return hr;
+    }
 
     hr = create_font_file(factory->localfontfileloader, key, key_size, font_file);
     free(key);
+
+    if (FAILED(hr))
+        TRACE("NULLREPLY: CreateFontFileReference create failed path=%s hr=0x%08x.\n", debugstr_w(path), hr);
 
     return hr;
 }
@@ -985,15 +1037,20 @@ HRESULT factory_get_cached_fontface(IDWriteFactory7 *iface, IDWriteFontFile * co
         DWRITE_FONT_SIMULATIONS cached_simulations;
         const void *cached_key;
         IDWriteFontFile *file;
+        IDWriteFontFace5 *fontface;
+        struct fontfacecached *verify;
+        BOOL alive = TRUE, attached = TRUE;
 
-        cached_face_index = IDWriteFontFace5_GetIndex(cached->fontface);
-        cached_simulations = IDWriteFontFace5_GetSimulations(cached->fontface);
+        fontface = cached->fontface;
+
+        cached_face_index = IDWriteFontFace5_GetIndex(fontface);
+        cached_simulations = IDWriteFontFace5_GetSimulations(fontface);
 
         /* skip earlier */
         if (cached_face_index != index || cached_simulations != simulations)
             continue;
 
-        hr = IDWriteFontFace5_GetFiles(cached->fontface, &count, &file);
+        hr = IDWriteFontFace5_GetFiles(fontface, &count, &file);
         if (FAILED(hr))
             break;
 
@@ -1004,11 +1061,52 @@ HRESULT factory_get_cached_fontface(IDWriteFactory7 *iface, IDWriteFontFile * co
 
         if (cached_key_size == key_size && !memcmp(cached_key, key, key_size))
         {
-            if (FAILED(hr = IDWriteFontFace5_QueryInterface(cached->fontface, riid, obj)))
+            /* Cached face slot fetch discipline: the wrapper is read from the slot
+               (under this section), pinned with a reference, and the slot is verified to
+               still resolve to the same instance before the face is handed out - a slot
+               that detaches mid-handout must not surface a wrapper behind it, and a
+               wrapper whose ft face object failed to build must not be handed out from a
+               slot at all (every metric or glyph call would dereference object 0). */
+            if (FAILED(hr = IDWriteFontFace5_QueryInterface(fontface, riid, obj)))
+            {
                 WARN("Failed to get %s from fontface, hr %#lx.\n", debugstr_guid(riid), hr);
+                alive = FALSE;
+            }
+            else if (!dwrite_fontface_check_font_object(fontface))
+            {
+                WARN("Cached fontface %p carries no ft face object.\n", fontface);
+                IDWriteFontFace5_Release(fontface);
+                *obj = NULL;
+                alive = FALSE;
+            }
+            else
+            {
+                attached = FALSE;
+                LIST_FOR_EACH_ENTRY(verify, fontfaces, struct fontfacecached, entry)
+                {
+                    if (verify != cached)
+                        continue;
+                    attached = TRUE;
+                    break;
+                }
 
-            TRACE("returning cached fontface %p\n", cached->fontface);
-            break;
+                if (!attached)
+                {
+                    WARN("Cached fontface %p left the slot it was read from.\n", fontface);
+                    IDWriteFontFace5_Release(fontface);
+                    *obj = NULL;
+                }
+            }
+
+            if (alive && attached)
+            {
+                TRACE("returning cached fontface %p\n", fontface);
+                break;
+            }
+
+            /* An equivalent live slot entry may follow; otherwise the caller builds a
+               fresh face from the same file, which reports its own object liveness. */
+            continue;
         }
     }
 
@@ -1054,16 +1152,28 @@ static HRESULT WINAPI dwritefactory_CreateFontFace(IDWriteFactory7 *iface, DWRIT
     *fontface = NULL;
 
     if (!is_face_type_supported(req_facetype))
+    {
+        TRACE("NULLREPLY: CreateFontFace facetype unsupported facetype=%d.\n", req_facetype);
         return E_INVALIDARG;
+    }
 
     if (req_facetype != DWRITE_FONT_FACE_TYPE_OPENTYPE_COLLECTION && index)
+    {
+        TRACE("NULLREPLY: CreateFontFace invalid index index=%u facetype=%d.\n", index, req_facetype);
         return E_INVALIDARG;
+    }
 
     if (!is_simulation_valid(simulations))
+    {
+        TRACE("NULLREPLY: CreateFontFace invalid simulations=0x%08x.\n", simulations);
         return E_INVALIDARG;
+    }
 
     if (FAILED(hr = get_filestream_from_file(*font_files, &stream)))
+    {
+        TRACE("NULLREPLY: CreateFontFace file stream failed hr=0x%08x.\n", hr);
         return hr;
+    }
 
     /* check actual file/face type */
     is_supported = FALSE;
@@ -1098,6 +1208,17 @@ static HRESULT WINAPI dwritefactory_CreateFontFace(IDWriteFactory7 *iface, DWRIT
 
 failed:
     IDWriteFontFileStream_Release(stream);
+
+    if (FAILED(hr))
+        TRACE("NULLREPLY: CreateFontFace failed facetype=%d index=%u hr=0x%08x.\n", req_facetype, index, hr);
+
+    /* A resolution that would dereference a dead ft face (the wrapper reported no live
+       face object behind it) resolves to the process pinned default face object instead
+       of leaving the caller a NULL or dead carrier - the same handout semantics as the
+       font resolution routes. */
+    if (hr == DWRITE_E_NOFONT && !*fontface)
+        return dwrite_get_default_fontface(iface, &IID_IDWriteFontFace, (void **)fontface);
+
     return hr;
 }
 
@@ -1186,11 +1307,25 @@ static HRESULT WINAPI dwritefactory_UnregisterFontFileLoader(IDWriteFactory7 *if
     if (!loader)
         return E_INVALIDARG;
 
+    /* Lookup, unlink and detach of the cached face slots all happen under the factory
+       critical section, the same section face resolution routes hold while searching the
+       slots: a route never searches a list that is being detached.  Taking the entry out
+       under the same section also claims it from a concurrent unregister of the same
+       loader, which then fails the lookup instead of racing the release. */
+    factory_lock(&factory->IDWriteFactory7_iface);
     found = factory_get_file_loader(factory, loader);
+    if (found)
+    {
+        list_remove(&found->entry);
+        release_fontface_cache(&found->fontfaces);
+    }
+    factory_unlock(&factory->IDWriteFactory7_iface);
+
     if (!found)
         return E_INVALIDARG;
 
-    release_fileloader(found);
+    IDWriteFontFileLoader_Release(found->loader);
+    free(found);
     return S_OK;
 }
 
@@ -1348,17 +1483,27 @@ static HRESULT WINAPI dwritefactory1_GetEudcFontCollection(IDWriteFactory7 *ifac
     BOOL check_for_updates)
 {
     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
-    HRESULT hr = S_OK;
+    IDWriteFontCollection *fetched;
+    IDWriteFontCollection3 *eudc_collection;
+    unsigned int attempt;
+    HRESULT hr;
 
     TRACE("%p, %p, %d.\n", iface, collection, check_for_updates);
 
     if (check_for_updates)
         FIXME("checking for eudc updates not implemented\n");
 
-    if (factory->eudc_collection)
-        IDWriteFontCollection1_AddRef(factory->eudc_collection);
-    else {
-        IDWriteFontCollection3 *eudc_collection;
+    /* Two attempts: same handout discipline as the cached system collection slots, since
+       a freshly stored cache entry can still be detached (collection released) before the
+       handout, and a truncated handout would surface a family that resolves to nothing. */
+    for (attempt = 0; attempt < 2; ++attempt)
+    {
+        if ((fetched = factory_fetch_cached_slot((IDWriteFontCollection3 **)&factory->eudc_collection)))
+        {
+            hr = IDWriteFontCollection_QueryInterface(fetched, &IID_IDWriteFontCollection, (void **)collection);
+            IDWriteFontCollection_Release(fetched);
+            return hr;
+        }
 
         if (FAILED(hr = get_eudc_fontcollection(iface, &eudc_collection)))
         {
@@ -1371,9 +1516,9 @@ static HRESULT WINAPI dwritefactory1_GetEudcFontCollection(IDWriteFactory7 *ifac
             IDWriteFontCollection3_Release(eudc_collection);
     }
 
-    *collection = (IDWriteFontCollection *)factory->eudc_collection;
-
-    return hr;
+    /* Both attempts lost the handout race: the out-param must not carry a stale caller value. */
+    *collection = NULL;
+    return E_FAIL;
 }
 
 static HRESULT WINAPI dwritefactory1_CreateCustomRenderingParams(IDWriteFactory7 *iface, FLOAT gamma,
@@ -1400,20 +1545,34 @@ static HRESULT WINAPI dwritefactory1_CreateCustomRenderingParams(IDWriteFactory7
 static HRESULT WINAPI dwritefactory2_GetSystemFontFallback(IDWriteFactory7 *iface, IDWriteFontFallback **fallback)
 {
     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+    IDWriteFontFallback1 *fallback1;
+    HRESULT hr;
 
     TRACE("%p, %p.\n", iface, fallback);
 
     *fallback = NULL;
 
+    /* Create and hand out under the factory lock, serialized with the instance
+       detach path, so two threads don't both build a cached instance and so
+       a concurrently disposed instance is never handed out. */
+    EnterCriticalSection(&factory->cs);
+
     if (!factory->fallback)
     {
-        HRESULT hr = create_system_fontfallback(iface, &factory->fallback);
+        hr = create_system_fontfallback(iface, &factory->fallback);
         if (FAILED(hr))
+        {
+            LeaveCriticalSection(&factory->cs);
             return hr;
+        }
     }
 
-    *fallback = (IDWriteFontFallback *)factory->fallback;
-    IDWriteFontFallback_AddRef(*fallback);
+    fallback1 = factory->fallback;
+    IDWriteFontFallback1_AddRef(fallback1);
+
+    LeaveCriticalSection(&factory->cs);
+
+    *fallback = (IDWriteFontFallback *)fallback1;
     return S_OK;
 }
 
@@ -1551,7 +1710,7 @@ static HKEY open_fonts_key(void)
     return hkey;
 }
 
-static HRESULT create_system_path_list(WCHAR ***ret, unsigned int *ret_count)
+HRESULT create_system_path_list(WCHAR ***ret, unsigned int *ret_count)
 {
     unsigned int index = 0, value_size, max_name_count;
     WCHAR **paths = NULL, *name, *value = NULL;
@@ -1662,13 +1821,11 @@ static int __cdecl create_system_fontset_compare(const void *left, const void *r
 
 static HRESULT factory_create_system_fontset(struct dwritefactory *factory, const FILETIME *timestamp)
 {
+    struct dwrite_fontset_entry **rebuilt = NULL;
     IDWriteFontSetBuilder2 *builder;
-    unsigned int i, j, count;
+    unsigned int i, j, count, rebuilt_count = 0;
     WCHAR **paths;
     HRESULT hr;
-
-    factory_cleanup_fontset(factory);
-    factory->system_set.timestamp = *timestamp;
 
     if (FAILED(hr = create_fontset_builder(&factory->IDWriteFactory7_iface, TRUE, &builder))) return hr;
 
@@ -1693,18 +1850,42 @@ static HRESULT factory_create_system_fontset(struct dwritefactory *factory, cons
         free(paths);
     }
 
-    hr = fontset_builder_get_entries(builder, &factory->system_set.entries, &factory->system_set.count);
+    /* The rebuilt content is materialized away from the factory table: the standing
+       table keeps serving the family-count view while the rebuild is in flight, so a
+       collection handed out during the rebuild window never tips over an emptied set. */
+    hr = fontset_builder_get_entries(builder, &rebuilt, &rebuilt_count);
     IDWriteFontSetBuilder2_Release(builder);
 
-    return hr;
+    /* The family-count view behind enumeration callers never collapses to zero:
+       an empty rebuild (a restart window scan that found no fonts, or no openable
+       fonts key) is rejected instead of replacing a standing non-empty snapshot.
+       The timestamp is only stamped for accepted content, so a rejected empty scan
+       is retried on the next fetch rather than pinning the empty view. */
+    if (SUCCEEDED(hr) && rebuilt_count)
+    {
+        factory_cleanup_fontset(factory);
+        factory->system_set.entries = rebuilt;
+        factory->system_set.count = rebuilt_count;
+        factory->system_set.timestamp = *timestamp;
+    }
+    else
+    {
+        for (i = 0; i < rebuilt_count; ++i)
+            release_fontset_entry(rebuilt[i]);
+        free(rebuilt);
+    }
+
+    return S_OK;
 }
 
 HRESULT create_system_fontset(IDWriteFactory7 *factory_iface, REFIID riid, void **obj)
 {
     struct dwritefactory *factory = impl_from_IDWriteFactory7(factory_iface);
+    struct dwrite_fontset_entry **seed_entries = NULL;
+    unsigned int seed_count = 0, i;
     IDWriteFontSet *fontset;
     FILETIME timestamp;
-    HRESULT hr = S_OK;
+    HRESULT hr;
 
     *obj = NULL;
 
@@ -1712,10 +1893,48 @@ HRESULT create_system_fontset(IDWriteFactory7 *factory_iface, REFIID riid, void 
 
     EnterCriticalSection(&factory->cs);
 
+    /* A rebuild attempt materializes its content away from the factory table and is
+       only accepted non-empty (see factory_create_system_fontset). If that attempt
+       still fails outright, the standing snapshot keeps serving the view below: a
+       restart window must not collapse a family count callers already enumerate
+       from to zero. */
     if (CompareFileTime(&timestamp, &factory->system_set.timestamp) > 0)
         hr = factory_create_system_fontset(factory, &timestamp);
+    else
+        hr = S_OK;
 
-    if (SUCCEEDED(hr))
+    /* The fresh-factory entry-instant hydration: when the attempt above still leaves
+       the standing table empty (a fresh factory whose first fetch hit a not-yet-built
+       state - an empty rebuild rejected away, or a builder that failed outright), the
+       catalogued seed content is installed synchronously so the view served from this
+       fetch - the collection build included - starts from a hydrated system set, never
+       an empty one. Installed seed content carries the fetch timestamp and is replaced
+       when the next real rebuild succeeds; a failed hydration is dropped and retried
+       on the next fetch like a rejected empty scan. */
+    if (!factory->system_set.entries || !factory->system_set.count)
+    {
+        seed_entries = NULL;
+        seed_count = 0;
+
+        if (SUCCEEDED(system_fontset_seed_entries(factory_iface, &seed_entries, &seed_count)) && seed_count)
+        {
+            factory_cleanup_fontset(factory);
+            factory->system_set.entries = seed_entries;
+            factory->system_set.count = seed_count;
+            factory->system_set.timestamp = timestamp;
+            hr = S_OK;
+            TRACE("Hydrated the fresh factory system table from the catalogued seed, %u entries.\n", seed_count);
+        }
+        else
+        {
+            TRACE("NULLREPLY: factory system fontset seed fill failed seedcnt=%u hr=0x%08x.\n", seed_count, hr);
+            for (i = 0; i < seed_count; ++i)
+                release_fontset_entry(seed_entries[i]);
+            free(seed_entries);
+        }
+    }
+
+    if (SUCCEEDED(hr) || (factory->system_set.entries && factory->system_set.count))
     {
         hr = fontset_create_from_set(factory_iface, factory->system_set.entries,
                 factory->system_set.count, TRUE, &fontset);
@@ -1893,6 +2112,8 @@ static HRESULT WINAPI dwritefactory5_UnpackFontFile(IDWriteFactory7 *iface, DWRI
         UINT32 data_size, IDWriteFontFileStream **stream)
 {
     FIXME("%p, %d, %p, %u, %p: stub\n", iface, container_type, data, data_size, stream);
+
+    TRACE("NULLREPLY: UnpackFontFile E_NOTIMPL containertype=%d.\n", container_type);
 
     return E_NOTIMPL;
 }
@@ -2262,6 +2483,24 @@ void factory_detach_gdiinterop(IDWriteFactory7 *iface, IDWriteGdiInterop1 *inter
     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
     factory->gdiinterop = NULL;
     IDWriteFactory7_Release(iface);
+}
+
+/* Detach the cached system fallback instance, handled under the factory lock that also
+   serializes GetSystemFontFallback() handouts. Returns TRUE when everything dropped the
+   instance (no concurrent handout happened, so the instance is disposable), and the
+   refcount is re-checked under the same lock to catch a handout that snuck in. */
+BOOL factory_detach_system_fontfallback(IDWriteFactory7 *iface, IDWriteFontFallback1 *fallback, LONG *refcount)
+{
+    struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+    IDWriteFontFallback1 *cached;
+    ULONG value;
+
+    EnterCriticalSection(&factory->cs);
+    cached = InterlockedCompareExchangePointer((void **)&factory->fallback, NULL, fallback);
+    value = InterlockedCompareExchange(refcount, 0, 0);
+    LeaveCriticalSection(&factory->cs);
+
+    return cached == fallback && value == 0;
 }
 
 HRESULT WINAPI DWriteCreateFactory(DWRITE_FACTORY_TYPE type, REFIID riid, IUnknown **ret)

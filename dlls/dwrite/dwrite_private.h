@@ -357,6 +357,9 @@ extern void release_system_fallback_data(void);
 extern HRESULT create_fontfallback_builder(IDWriteFactory7 *factory, IDWriteFontFallbackBuilder **builder);
 extern HRESULT create_matching_font(IDWriteFontCollection *collection, const WCHAR *family, DWRITE_FONT_WEIGHT weight,
         DWRITE_FONT_STYLE style, DWRITE_FONT_STRETCH stretch, REFIID riid, void **obj);
+extern HRESULT dwrite_get_default_font(IDWriteFactory7 *factory, REFIID riid, void **obj);
+extern HRESULT dwrite_get_default_fontfamily(IDWriteFactory7 *factory, REFIID riid, void **obj);
+extern HRESULT dwrite_get_default_fontface(IDWriteFactory7 *factory, REFIID riid, void **obj);
 extern HRESULT create_fontfacereference(IDWriteFactory7 *factory, IDWriteFontFile *file, UINT32 face_index,
         DWRITE_FONT_SIMULATIONS simulations, DWRITE_FONT_AXIS_VALUE const *axis_values, UINT32 axis_values_count,
         IDWriteFontFaceReference1 **reference);
@@ -364,6 +367,7 @@ extern HRESULT factory_get_cached_fontface(IDWriteFactory7 *factory, IDWriteFont
         DWRITE_FONT_SIMULATIONS simulations, struct list **cache, REFIID riid, void **obj);
 extern void factory_detach_fontcollection(IDWriteFactory7 *factory, IDWriteFontCollection3 *collection);
 extern void factory_detach_gdiinterop(IDWriteFactory7 *factory, IDWriteGdiInterop1 *interop);
+extern BOOL factory_detach_system_fontfallback(IDWriteFactory7 *factory, IDWriteFontFallback1 *fallback, LONG *refcount);
 extern struct fontfacecached *factory_cache_fontface(IDWriteFactory7 *factory, struct list *fontfaces,
         IDWriteFontFace5 *fontface);
 extern IDWriteFontFile *get_fontfile_from_font(IDWriteFont *font);
@@ -373,6 +377,7 @@ extern HRESULT get_fontsig_from_font(IDWriteFont*,FONTSIGNATURE*);
 extern HRESULT get_fontsig_from_fontface(IDWriteFontFace*,FONTSIGNATURE*);
 extern HRESULT create_gdiinterop(IDWriteFactory7 *factory, IDWriteGdiInterop1 **interop);
 extern void fontface_detach_from_cache(IDWriteFontFace5 *fontface);
+extern BOOL dwrite_fontface_check_font_object(IDWriteFontFace5 *fontface);
 extern void factory_lock(IDWriteFactory7 *factory);
 extern void factory_unlock(IDWriteFactory7 *factory);
 extern HRESULT create_inmemory_fileloader(IDWriteInMemoryFontFileLoader **loader);
@@ -385,12 +390,25 @@ extern HRESULT create_font_collection_from_set(IDWriteFactory7 *factory, IDWrite
         DWRITE_FONT_FAMILY_MODEL family_model, REFGUID riid, void **ret);
 extern HRESULT create_system_fontset(IDWriteFactory7 *factory, REFIID riid, void **obj);
 
+/* Resident system font file list (registry fonts table) - backs the catalogued
+   fallback families a system collection view is seeded with when it would
+   otherwise surface with zero families. */
+extern HRESULT create_system_path_list(WCHAR ***ret, unsigned int *ret_count);
+
 struct dwrite_fontset_entry;
 extern void release_fontset_entry(struct dwrite_fontset_entry *);
 extern HRESULT fontset_builder_get_entries(IDWriteFontSetBuilder2 *iface, struct dwrite_fontset_entry ***ret,
         unsigned int *count);
 extern HRESULT fontset_create_from_set(IDWriteFactory7 *factory, struct dwrite_fontset_entry **src_entries,
         unsigned int count, BOOL is_system, IDWriteFontSet **ret);
+
+/* Fresh-factory entry-instant hydration: materializes the catalogued seed content
+   (faces of the first loadable resident system font file) away from the factory
+   table. create_system_fontset installs it when a fresh factory's build/rebuild
+   attempt has left its standing table empty, so the first GetSystemFontCollection
+   entry instant serves a hydrated set view instead of an empty one. */
+extern HRESULT system_fontset_seed_entries(IDWriteFactory7 *factory, struct dwrite_fontset_entry ***ret,
+        unsigned int *ret_count);
 
 struct dwrite_fontface;
 

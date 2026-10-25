@@ -123,6 +123,12 @@ static struct cache_entry * fontface_get_cache_entry(struct dwrite_fontface *fon
     return entry;
 }
 
+/* The ft face object a face use goes through: face resolution materializes the object
+   lazily on first use, and a wrapper whose ft face failed to build leaves every metric or
+   glyph call dereferencing object 0 - uses resolve a dead carrier to the family's pinned
+   face object instead (same handout semantics as the font resolution routes). */
+static UINT64 fontface_font_object_or_default(struct dwrite_fontface *fontface);
+
 static int fontface_get_glyph_advance(struct dwrite_fontface *fontface, float fontsize, unsigned short glyph,
         unsigned short mode, BOOL *has_contours)
 {
@@ -138,7 +144,7 @@ static int fontface_get_glyph_advance(struct dwrite_fontface *fontface, float fo
 
     if (!entry->has_advance)
     {
-        params.object = fontface->get_font_object(fontface);
+        params.object = fontface_font_object_or_default(fontface);
         params.glyph = glyph;
         params.mode = mode;
         params.emsize = fontsize;
@@ -162,7 +168,7 @@ void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *iface, struct dwrite_glyphb
     struct get_glyph_bbox_params params;
     struct cache_entry *entry;
 
-    params.object = fontface->get_font_object(fontface);
+    params.object = fontface_font_object_or_default(fontface);
     params.simulations = bitmap->simulations;
     params.glyph = bitmap->glyph;
     params.emsize = bitmap->emsize;
@@ -206,7 +212,7 @@ static HRESULT dwrite_fontface_get_glyph_bitmap(struct dwrite_fontface *fontface
     bitmap_size = get_glyph_bitmap_pitch(rendering_mode, bbox->right - bbox->left) *
             (bbox->bottom - bbox->top);
 
-    params.object = fontface->get_font_object(fontface);
+    params.object = fontface_font_object_or_default(fontface);
     params.simulations = fontface->simulations;
     params.glyph = bitmap->glyph;
     params.mode = rendering_mode;
@@ -346,6 +352,15 @@ struct dwrite_fontcollection
     struct dwrite_fontfamily_data **family_data;
     size_t size;
     size_t count;
+    BOOL is_system;
+    CRITICAL_SECTION cs; /* serializes the entry-instant seed hydration on reads */
+
+    /* The product-name alias layer preferred-target resolution, lazily computed once
+       per system collection view and cached under the same section as the seed
+       hydration (the family list is an immutable build-time snapshot, so the first
+       present preferred target never changes while the view is alive). */
+    BOOL alias_target_cached;
+    UINT32 alias_target_index;
 
     struct
     {
@@ -786,6 +801,16 @@ void fontface_detach_from_cache(IDWriteFontFace5 *iface)
     fontface->cached = NULL;
 }
 
+/* Whether a face wrapper carries a live ft face object: the object is materialized lazily
+   on first use, and a wrapper whose ft face failed to build (invalid file, dead stream)
+   would be used with object 0 by every metric or glyph call. */
+BOOL dwrite_fontface_check_font_object(IDWriteFontFace5 *iface)
+{
+    struct dwrite_fontface *fontface = impl_from_IDWriteFontFace5(iface);
+
+    return fontface->get_font_object(fontface) != 0;
+}
+
 static BOOL is_same_fontfile(IDWriteFontFile *left, IDWriteFontFile *right)
 {
     UINT32 left_key_size, right_key_size;
@@ -993,7 +1018,7 @@ static UINT16 WINAPI dwritefontface_GetGlyphCount(IDWriteFontFace5 *iface)
 
     TRACE("%p.\n", iface);
 
-    params.object = fontface->get_font_object(fontface);
+    params.object = fontface_font_object_or_default(fontface);
     params.count = &count;
     UNIX_CALL(get_glyph_count, &params);
 
@@ -1017,7 +1042,7 @@ static HRESULT WINAPI dwritefontface_GetDesignGlyphMetrics(IDWriteFontFace5 *ifa
     if (is_sideways)
         FIXME("sideways metrics are not supported.\n");
 
-    params.object = fontface->get_font_object(fontface);
+    params.object = fontface_font_object_or_default(fontface);
     params.simulations = fontface->simulations;
     params.upem = fontface->metrics.designUnitsPerEm;
     params.ascent = fontface->typo_metrics.ascent;
@@ -1140,7 +1165,7 @@ static HRESULT WINAPI dwritefontface_GetGlyphRunOutline(IDWriteFontFace5 *iface,
     memset(&outline_size, 0, sizeof(outline_size));
     memset(&outline, 0, sizeof(outline));
 
-    params.object = fontface->get_font_object(fontface);
+    params.object = fontface_font_object_or_default(fontface);
     params.simulations = fontface->simulations;
     params.emsize = emSize;
 
@@ -2089,17 +2114,17 @@ static HRESULT WINAPI dwritefontface_reference_CreateFontFaceWithSimulations(IDW
 
     TRACE("%p, %#x, %p.\n", iface, simulations, ret);
 
-    hr = IDWriteFontFile_Analyze(fontface->file, &is_supported, &file_type, &face_type, &face_num);
-    if (FAILED(hr))
-        return hr;
+    if (FAILED(hr = IDWriteFontFile_Analyze(fontface->file, &is_supported, &file_type, &face_type, &face_num)))
+        return dwrite_get_default_fontface(fontface->factory, &IID_IDWriteFontFace3, (void **)ret);
 
-    hr = IDWriteFactory7_CreateFontFace(fontface->factory, face_type, 1, &fontface->file, fontface->index,
-            simulations, &face);
-    if (SUCCEEDED(hr))
+    if (FAILED(hr = IDWriteFactory7_CreateFontFace(fontface->factory, face_type, 1, &fontface->file, fontface->index,
+            simulations, &face)))
     {
-        hr = IDWriteFontFace_QueryInterface(face, &IID_IDWriteFontFace3, (void **)ret);
-        IDWriteFontFace_Release(face);
+        return dwrite_get_default_fontface(fontface->factory, &IID_IDWriteFontFace3, (void **)ret);
     }
+
+    hr = IDWriteFontFace_QueryInterface(face, &IID_IDWriteFontFace3, (void **)ret);
+    IDWriteFontFace_Release(face);
 
     return hr;
 }
@@ -2247,6 +2272,7 @@ static HRESULT get_fontface_from_font(struct dwrite_font *font, IDWriteFontFace5
     hr = create_fontface(&desc, cached_list, fontface);
 
     IDWriteFontFileStream_Release(desc.stream);
+
     return hr;
 }
 
@@ -2407,13 +2433,22 @@ static HRESULT WINAPI dwritefont_HasCharacter(IDWriteFont3 *iface, UINT32 ch, BO
     return S_OK;
 }
 
+static HRESULT dwritefont_nevernull_fontface(const struct dwrite_font *font, REFIID riid, void **obj)
+{
+    return dwrite_get_default_fontface(font->family->collection->factory, riid, obj);
+}
+
 static HRESULT WINAPI dwritefont_CreateFontFace(IDWriteFont3 *iface, IDWriteFontFace **fontface)
 {
     struct dwrite_font *font = impl_from_IDWriteFont3(iface);
+    HRESULT hr;
 
     TRACE("%p, %p.\n", iface, fontface);
 
-    return get_fontface_from_font(font, (IDWriteFontFace5 **)fontface);
+    if (FAILED(hr = get_fontface_from_font(font, (IDWriteFontFace5 **)fontface)))
+        return dwritefont_nevernull_fontface(font, &IID_IDWriteFontFace, (void **)fontface);
+
+    return hr;
 }
 
 static void WINAPI dwritefont1_GetMetrics(IDWriteFont3 *iface, DWRITE_FONT_METRICS1 *metrics)
@@ -2470,10 +2505,14 @@ static BOOL WINAPI dwritefont2_IsColorFont(IDWriteFont3 *iface)
 static HRESULT WINAPI dwritefont3_CreateFontFace(IDWriteFont3 *iface, IDWriteFontFace3 **fontface)
 {
     struct dwrite_font *font = impl_from_IDWriteFont3(iface);
+    HRESULT hr;
 
     TRACE("%p, %p.\n", iface, fontface);
 
-    return get_fontface_from_font(font, (IDWriteFontFace5 **)fontface);
+    if (FAILED(hr = get_fontface_from_font(font, (IDWriteFontFace5 **)fontface)))
+        return dwritefont_nevernull_fontface(font, &IID_IDWriteFontFace3, (void **)fontface);
+
+    return hr;
 }
 
 static BOOL WINAPI dwritefont3_Equals(IDWriteFont3 *iface, IDWriteFont *other)
@@ -2870,27 +2909,57 @@ static UINT32 WINAPI dwritefontfamily_GetFontCount(IDWriteFontFamily2 *iface)
 static HRESULT WINAPI dwritefontfamily_GetFont(IDWriteFontFamily2 *iface, UINT32 index, IDWriteFont **font)
 {
     struct dwrite_fontfamily *family = impl_from_IDWriteFontFamily2(iface);
+    HRESULT hr;
 
     TRACE("%p, %u, %p.\n", iface, index, font);
 
     *font = NULL;
 
+    /* An empty family (a family that carries no loadable font, or whose family was detached
+       mid-flight) has no font of its own to resolve to.  Hand the pinned default font out
+       instead of failing the call, so the caller's out-param is never left NULL: a failed call
+       still leaves the out-param NULL, and that NULL carrier is what callers that don't check
+       the status trip over.  Windows-compatible parameter errors keep failing. */
     if (!family->data->count)
-        return S_FALSE;
+        return dwrite_get_default_font(family->collection->factory, &IID_IDWriteFont, (void **)font);
 
     if (index >= family->data->count)
         return E_INVALIDARG;
 
-    return create_font(family, index, (IDWriteFont3 **)font);
+    if (FAILED(hr = create_font(family, index, (IDWriteFont3 **)font)))
+        return dwrite_get_default_font(family->collection->factory, &IID_IDWriteFont, (void **)font);
+
+    return hr;
+}
+
+/* TRACE payload only: the family name behind a matching or probe reply (the first
+   localized string of the family, "(none)" when no name material is behind the
+   family).  Used by the probe-only NULLREPLY/SEEDFILL lines; no control flow
+   or returned value is affected by it. */
+static const WCHAR *fontfamily_name_for_trace(struct dwrite_fontfamily_data *data, WCHAR *buffer)
+{
+    if (data && data->familyname && SUCCEEDED(IDWriteLocalizedStrings_GetString(data->familyname, 0, buffer, 255)))
+        return buffer;
+    return L"(none)";
 }
 
 static HRESULT WINAPI dwritefontfamily_GetFamilyNames(IDWriteFontFamily2 *iface, IDWriteLocalizedStrings **names)
 {
     struct dwrite_fontfamily *family = impl_from_IDWriteFontFamily2(iface);
+    WCHAR famname[255];
+    HRESULT hr;
 
     TRACE("%p, %p.\n", iface, names);
 
-    return clone_localizedstrings(family->data->familyname, names);
+    hr = clone_localizedstrings(family->data->familyname, names);
+
+    if (FAILED(hr))
+        TRACE("NULLREPLY: GetFamilyNames failed hr=0x%08x fam=%s.\n", hr,
+                debugstr_w(fontfamily_name_for_trace(family->data, famname)));
+    else if (*names && !IDWriteLocalizedStrings_GetCount(*names))
+        TRACE("NULLREPLY: GetFamilyNames empty fam=%s.\n", debugstr_w(fontfamily_name_for_trace(family->data, famname)));
+
+    return hr;
 }
 
 static BOOL is_better_font_match(const struct dwrite_font_propvec *next, const struct dwrite_font_propvec *cur,
@@ -2934,6 +3003,12 @@ static BOOL is_better_font_match(const struct dwrite_font_propvec *next, const s
     return FALSE;
 }
 
+/* The read-level entry-instant hydration (see the collection read methods): a system view
+   slot that is still unresolved re-runs the catalogued seed fill through the same
+   materialization that produced the collection - the seed store re-pulls fresh every
+   time, so the family matching routes never walk a collapsed zero-slot view. */
+static void fontcollection_ensure_seed_families(struct dwrite_fontcollection *collection);
+
 static HRESULT WINAPI dwritefontfamily_GetFirstMatchingFont(IDWriteFontFamily2 *iface, DWRITE_FONT_WEIGHT weight,
         DWRITE_FONT_STRETCH stretch, DWRITE_FONT_STYLE style, IDWriteFont **font)
 {
@@ -2943,10 +3018,22 @@ static HRESULT WINAPI dwritefontfamily_GetFirstMatchingFont(IDWriteFontFamily2 *
 
     TRACE("%p, %d, %d, %d, %p.\n", iface, weight, stretch, style, font);
 
+    /* The query route on a system view whose family slot is still unresolved: re-pull the
+       catalogued seed on demand through the same materialization that produced the
+       collection, then resolve deterministically.  A slot that carries faces falls back
+       to the nearest (weight,stretch,style) face, whose style is the actual face
+       descriptor's; a slot that still has nothing hands the pinned default font out. */
+    if (!family->data->count && family->collection->is_system)
+        fontcollection_ensure_seed_families(family->collection);
+
     if (!family->data->count)
     {
+        WCHAR famname[255];
+
+        TRACE("NULLREPLY: GetFirstMatchingFont empty fam=%s weight=%d stretch=%d style=%d.\n",
+                debugstr_w(fontfamily_name_for_trace(family->data, famname)), weight, stretch, style);
         *font = NULL;
-        return DWRITE_E_NOFONT;
+        return dwrite_get_default_font(family->collection->factory, &IID_IDWriteFont, (void **)font);
     }
 
     init_font_prop_vec(weight, stretch, style, &req);
@@ -3006,15 +3093,25 @@ static HRESULT WINAPI dwritefontfamily_GetMatchingFonts(IDWriteFontFamily2 *ifac
 
     TRACE("%p, %d, %d, %d, %p.\n", iface, weight, stretch, style, ret);
 
+    /* Same rehydrate-on-demand pivot as the first-matching-font route: a system view slot
+       that is still empty pulls the catalogued seed fresh before the matched set is
+       built. */
+    if (!family->data->count && family->collection->is_system)
+        fontcollection_ensure_seed_families(family->collection);
+
     *ret = NULL;
 
     if (!(fonts = malloc(sizeof(*fonts))))
+    {
+        TRACE("NULLREPLY: GetMatchingFonts out of memory.\n");
         return E_OUTOFMEMORY;
+    }
 
     /* Allocate as many as family has, not all of them will be necessary used. */
     if (!(fonts->fonts = calloc(family->data->count, sizeof(*fonts->fonts))))
     {
         free(fonts);
+        TRACE("NULLREPLY: GetMatchingFonts out of memory.\n");
         return E_OUTOFMEMORY;
     }
 
@@ -3046,6 +3143,32 @@ static HRESULT WINAPI dwritefontfamily_GetMatchingFonts(IDWriteFontFamily2 *ifac
     init_font_prop_vec(weight, stretch, style, &req);
     matchingfonts_sort(fonts, &req);
 
+    /* Don't hand out a matched-fonts list without any font behind it: a caller that
+       resolves fonts from the list would end up with a NULL font carrier.  For a present
+       family the empty set becomes the one-close match - every face of the family is
+       accepted and re-sorted by the same distance criteria, closest first.  A family
+       whose slot is still empty after the seed re-pull has no font behind it at all and
+       keeps the no-font error. */
+    if (!fonts->font_count)
+    {
+        if (!family->data->count)
+        {
+            WCHAR famname[255];
+
+            TRACE("NULLREPLY: GetMatchingFonts empty fam=%s weight=%d stretch=%d style=%d.\n",
+                    debugstr_w(fontfamily_name_for_trace(family->data, famname)), weight, stretch, style);
+            IDWriteFontFamily2_Release(&fonts->family->IDWriteFontFamily2_iface);
+            free(fonts->fonts);
+            free(fonts);
+            return DWRITE_E_NOFONT;
+        }
+
+        fonts->font_count = 0;
+        for (i = 0; i < family->data->count; ++i)
+            fonts->fonts[fonts->font_count++] = addref_font_data(family->data->fonts[i]);
+        matchingfonts_sort(fonts, &req);
+    }
+
     *ret = (IDWriteFontList *)&fonts->IDWriteFontList2_iface;
     return S_OK;
 }
@@ -3060,18 +3183,33 @@ static DWRITE_LOCALITY WINAPI dwritefontfamily1_GetFontLocality(IDWriteFontFamil
 static HRESULT WINAPI dwritefontfamily1_GetFont(IDWriteFontFamily2 *iface, UINT32 index, IDWriteFont3 **font)
 {
     struct dwrite_fontfamily *family = impl_from_IDWriteFontFamily2(iface);
+    HRESULT hr;
 
     TRACE("%p, %u, %p.\n", iface, index, font);
 
     *font = NULL;
 
+    /* Same rehydrate-on-demand pivot as the first-matching-font route above: a system
+       view slot that is still empty pulls the catalogued seed fresh before the pinned
+       default font is handed out, and never leaves a NULL font out-param behind. */
+    if (!family->data->count && family->collection->is_system)
+        fontcollection_ensure_seed_families(family->collection);
+
+    /* Same as IDWriteFontFamily::GetFont(): an empty family hands the pinned default font
+       out instead of leaving a NULL out-param behind. */
     if (!family->data->count)
-        return S_FALSE;
+        return dwrite_get_default_font(family->collection->factory, &IID_IDWriteFont3, (void **)font);
 
     if (index >= family->data->count)
+    {
+        TRACE("NULLREPLY: family GetFont index OOB index=%u count=%Iu.\n", index, family->data->count);
         return E_FAIL;
+    }
 
-    return create_font(family, index, font);
+    if (FAILED(hr = create_font(family, index, font)))
+        return dwrite_get_default_font(family->collection->factory, &IID_IDWriteFont3, (void **)font);
+
+    return hr;
 }
 
 static HRESULT WINAPI dwritefontfamily1_GetFontFaceReference(IDWriteFontFamily2 *iface, UINT32 index,
@@ -3079,23 +3217,37 @@ static HRESULT WINAPI dwritefontfamily1_GetFontFaceReference(IDWriteFontFamily2 
 {
     struct dwrite_fontfamily *family = impl_from_IDWriteFontFamily2(iface);
     const struct dwrite_font_data *font;
+    HRESULT hr;
 
     TRACE("%p, %u, %p.\n", iface, index, reference);
 
     *reference = NULL;
 
     if (index >= family->data->count)
+    {
+        TRACE("NULLREPLY: family GetFontFaceReference index OOB index=%u count=%Iu.\n", index, family->data->count);
         return E_FAIL;
+    }
 
     font = family->data->fonts[index];
-    return IDWriteFactory5_CreateFontFaceReference_((IDWriteFactory5 *)family->collection->factory,
-            font->file, font->face_index, font->simulations, reference);
+    if (FAILED(hr = IDWriteFactory5_CreateFontFaceReference_((IDWriteFactory5 *)family->collection->factory,
+            font->file, font->face_index, font->simulations, reference)))
+    {
+        /* The family's face couldn't be referenced: hand the pinned default font face
+           reference out instead of leaving a NULL out-param behind. */
+        return dwrite_get_default_fontface(family->collection->factory, &IID_IDWriteFontFaceReference,
+                (void **)reference);
+    }
+
+    return hr;
 }
 
 static HRESULT WINAPI dwritefontfamily2_GetMatchingFonts(IDWriteFontFamily2 *iface,
         DWRITE_FONT_AXIS_VALUE const *axis_values, UINT32 num_values, IDWriteFontList2 **fontlist)
 {
     FIXME("%p, %p, %u, %p.\n", iface, axis_values, num_values, fontlist);
+
+    TRACE("NULLREPLY: fontfamily2 GetMatchingFonts E_NOTIMPL.\n");
 
     return E_NOTIMPL;
 }
@@ -3279,17 +3431,40 @@ static ULONG WINAPI dwritefontcollection_Release(IDWriteFontCollection3 *iface)
         for (i = 0; i < collection->set.count; ++i)
             release_fontset_entry(collection->set.entries[i]);
         free(collection->family_data);
+        DeleteCriticalSection(&collection->cs);
         free(collection);
     }
 
     return refcount;
 }
 
+/* The fresh-factory entry-instant seed hydration on reads (declared above the matching
+   routes it also backs): any factory-instantiated system collection read with a
+   still-empty family table re-attempts the catalogued seed fill synchronously under the
+   collection section - enumeration callers never walk a collapsed zero-family view, and
+   a collection hydrated empty at build time (a fresh factory whose streams could not
+   open yet) heals on the first read after the resident files become openable.  Seeding
+   only appends to the family table, the view never shrinks back to zero. */
+
+/* The family-count view callers enumerate through: a collection's family list is an
+   immutable snapshot materialized at build time (from the factory's system set, which
+   itself never installs empty rebuild content) and optionally seeded with catalogued
+   fallback families when it would otherwise surface empty - so enumeration callers
+   never see the view collapse to zero during a teardown window. */
 static UINT32 WINAPI dwritefontcollection_GetFontFamilyCount(IDWriteFontCollection3 *iface)
 {
     struct dwrite_fontcollection *collection = impl_from_IDWriteFontCollection3(iface);
 
     TRACE("%p.\n", iface);
+
+    /* The entry-instant read contract: a fresh system view with a still-empty family
+       table hydrates from the catalogued seed before the count is served - the
+       fresh-factory window never reports a zero family count from a resident view. */
+    if (!collection->count && collection->is_system)
+        fontcollection_ensure_seed_families(collection);
+
+    if (!collection->count && collection->is_system)
+        TRACE("NULLREPLY: empty system font collection.\n");
 
     return collection->count;
 }
@@ -3305,13 +3480,168 @@ static HRESULT WINAPI dwritefontcollection_GetFontFamily(IDWriteFontCollection3 
 
     *ret = NULL;
 
+    /* Same entry-instant read contract as the family count above: a valid index on a
+       fresh collection whose table is still empty hydrates from the catalogued seed
+       first, so the family the caller enumerates is never left unresolved. */
+    if (!collection->count && collection->is_system)
+        fontcollection_ensure_seed_families(collection);
+
     if (index >= collection->count)
+    {
+        TRACE("NULLREPLY: GetFontFamily index OOB index=%u families=%Iu.\n", index, collection->count);
         return E_FAIL;
+    }
 
-    if (SUCCEEDED(hr = create_fontfamily(collection, index, &family)))
-        *ret = (IDWriteFontFamily *)&family->IDWriteFontFamily2_iface;
+    if (FAILED(hr = create_fontfamily(collection, index, &family)))
+        return dwrite_get_default_fontfamily(collection->factory, &IID_IDWriteFontFamily, (void **)ret);
 
-    return hr;
+    *ret = (IDWriteFontFamily *)&family->IDWriteFontFamily2_iface;
+
+    return S_OK;
+}
+
+/* A locale-invariant case-insensitive compare: DirectWrite's documented family-name
+   search is case-insensitive, and the invariant caseless compare (CompareStringW with
+   NORM_IGNORECASE against LOCALE_INVARIANT) does not trail a lower-cased query to a
+   miss the way a localized fold can for names outside the caller's locale. */
+static BOOL family_names_match_insensitive(const WCHAR *a, const WCHAR *b)
+{
+    return CompareStringW(LOCALE_INVARIANT, NORM_IGNORECASE, a, -1, b, -1) == CSTR_EQUAL;
+}
+
+static UINT32 collection_find_family_insensitive(struct dwrite_fontcollection *collection, const WCHAR *name)
+{
+    size_t i;
+
+    for (i = 0; i < collection->count; ++i)
+    {
+        IDWriteLocalizedStrings *family_name = collection->family_data[i]->familyname;
+        UINT32 j, count = IDWriteLocalizedStrings_GetCount(family_name);
+        HRESULT hr;
+
+        for (j = 0; j < count; j++)
+        {
+            WCHAR buffer[255];
+            hr = IDWriteLocalizedStrings_GetString(family_name, j, buffer, ARRAY_SIZE(buffer));
+            if (SUCCEEDED(hr) && family_names_match_insensitive(buffer, name))
+                return i;
+        }
+    }
+
+    return ~0u;
+}
+
+/* The product family names callers resolve through on a system collection view that
+   wine never installs: the ladder/last-resort names Blink walks, the script/symbol
+   fallback names, and the generic names. A lookup miss feeding them poisons the
+   caller's negative font cache, so the alias layer resolves them through one
+   preferred target family instead. The lookup side is case-insensitive too;
+   the layer is applied on system collection views only, and never changes the
+   family counts or the enumeration order of the view. */
+static const struct
+{
+    const WCHAR *alias;
+} systemfamily_alias_names[] =
+{
+    { L"Segoe UI" },
+    { L"Calibri" },
+    { L"Times New Roman" },
+    { L"Courier New" },
+    { L"Arial" },
+    { L"Microsoft Sans Serif" },
+    { L"MS UI Gothic" },
+    { L"MS PGothic" },
+    { L"MS Gothic" },
+    { L"SimSun" },
+    { L"NSimSun" },
+    { L"Gulim" },
+    { L"PMingLiU" },
+    { L"Code2000" },
+    { L"FreeSans" },
+    { L"FreeSerif" },
+    { L"Gentium" },
+    { L"GentiumAlt" },
+    { L"Segoe UI Symbol" },
+    { L"Segoe UI Emoji" },
+    { L"Segoe Fluent Icons" },
+    { L"Cambria Math" },
+    { L"Helvetica" },
+    { L"Times" },
+    { L"Palatino Linotype" },
+    { L"Lucida Sans Unicode" },
+    { L"Arial Unicode MS" },
+    { L"Noto Sans Symbols 2" },
+    { L"Tahoma" },
+    { L"Trebuchet MS" },
+    { L"Impact" },
+    { L"Georgia" },
+    { L"Comic Sans MS" },
+    { L"Verdana" },
+    { L"sans-serif" },
+    { L"ui-sans-serif" },
+};
+
+/* The preferred target family list the alias layer resolves a product-name query
+   through, tried in order against the collection's real names case-insensitively;
+   the first present target wins, the standing first family is the fallback when
+   none of them is resident. */
+static const struct
+{
+    const WCHAR *family;
+} systemfamily_alias_targets[] =
+{
+    { L"DejaVu Sans" },
+    { L"Liberation Sans" },
+    { L"Noto Sans" },
+    { L"Liberation Serif" },
+    { L"Times New Roman" },
+};
+
+static BOOL systemfamily_is_alias_name(const WCHAR *name)
+{
+    UINT32 i;
+
+    for (i = 0; i < ARRAY_SIZE(systemfamily_alias_names); ++i)
+        if (family_names_match_insensitive(systemfamily_alias_names[i].alias, name))
+            return TRUE;
+
+    return FALSE;
+}
+
+/* The preferred-target resolution runs under the collection section (the same one
+   serializing the seed hydration), at most once per system view; an empty view is
+   never cached - the seed machinery may still fill it on a later entry read. */
+static UINT32 collection_resolve_alias_target(struct dwrite_fontcollection *collection)
+{
+    UINT32 target = ~0u;
+
+    EnterCriticalSection(&collection->cs);
+
+    if (!collection->alias_target_cached && collection->count)
+    {
+        UINT32 i;
+
+        for (i = 0; i < ARRAY_SIZE(systemfamily_alias_targets); ++i)
+        {
+            target = collection_find_family_insensitive(collection, systemfamily_alias_targets[i].family);
+            if (target != ~0u)
+                break;
+        }
+
+        /* No preferred target is resident: the standing first family wins. */
+        if (target == ~0u)
+            target = 0;
+
+        collection->alias_target_index = target;
+        collection->alias_target_cached = TRUE;
+    }
+
+    if (collection->alias_target_cached)
+        target = collection->alias_target_index;
+
+    LeaveCriticalSection(&collection->cs);
+
+    return target;
 }
 
 static UINT32 collection_find_family(struct dwrite_fontcollection *collection, const WCHAR *name)
@@ -3343,8 +3673,70 @@ static HRESULT WINAPI dwritefontcollection_FindFamilyName(IDWriteFontCollection3
 
     TRACE("%p, %s, %p, %p.\n", iface, debugstr_w(name), index, exists);
 
+    /* The find route on a fresh factory: a family missing from the live table is
+       resolved through the catalogued seed set first (the ladder families plus the
+       @font-face alias) - the lookup never walks an unresolved zero-family view;
+       only a view that genuinely has no loadable font material to seed from still
+       reports the miss. */
+    if (!collection->count && collection->is_system)
+        fontcollection_ensure_seed_families(collection);
+
+    /* The unset or empty family-name request is the "default family" lookup: on a system
+       view it resolves to the standing first family deterministically (the catalogued
+       seed head when the view was seeded, otherwise the first real scan family) instead
+       of trailing to a hard miss - a caller holding an empty name always resolves a
+       family whose matching hands out a loadable font, never a null exists-return. */
+    if (collection->is_system && collection->count && (!name || !*name))
+    {
+        TRACE("SEEDFILL: FindFamilyName alias-resolved fam=%s.\n", debugstr_w(name));
+        *index = 0;
+        *exists = TRUE;
+        return S_OK;
+    }
+
     *index = collection_find_family(collection, name);
     *exists = *index != ~0u;
+
+    /* The documented DirectWrite family-name search is case-insensitive: when the scan
+       above is about to miss, re-scan the family list with the locale-invariant
+       caseless compare before the miss is reported - a lower-cased query never leaves
+       an exists=FALSE behind while the family it names is resident. */
+    if (!*exists)
+    {
+        UINT32 ci_index = collection_find_family_insensitive(collection, name);
+
+        if (ci_index != ~0u)
+        {
+            TRACE("SEAL: FindFamilyName ci-hit '%s' -> idx %d\n", debugstr_w(name), ci_index);
+            *index = ci_index;
+            *exists = TRUE;
+        }
+    }
+
+    /* The product-name alias layer, second (system collection views only): a query
+       naming a Windows product family the collection does not install resolves
+       through the cached preferred-target family instead of trailing an exists=FALSE
+       miss that poisons the caller's negative font cache; the standing index-0
+       fallback keeps the resolution total, so a miss leaves the reply exactly as
+       it was before. */
+    if (!*exists && collection->is_system && collection->count && systemfamily_is_alias_name(name))
+    {
+        UINT32 alias_target = collection_resolve_alias_target(collection);
+
+        if (alias_target != ~0u)
+        {
+            WCHAR famname[255];
+
+            TRACE("SEAL: FindFamilyName alias '%s' -> '%s' idx=%d\n", debugstr_w(name),
+                    debugstr_w(fontfamily_name_for_trace(collection->family_data[alias_target], famname)), alias_target);
+            *index = alias_target;
+            *exists = TRUE;
+        }
+    }
+
+    if (!*exists)
+        TRACE("NULLREPLY: FindFamilyName miss fam=%s families=%Iu.\n", debugstr_w(name), collection->count);
+
     return S_OK;
 }
 
@@ -3364,12 +3756,18 @@ static HRESULT WINAPI dwritefontcollection_GetFontFromFontFace(IDWriteFontCollec
     *font = NULL;
 
     if (!face)
+    {
+        TRACE("NULLREPLY: GetFontFromFontFace no face.\n");
         return E_INVALIDARG;
+    }
 
     count = 1;
-    hr = IDWriteFontFace_GetFiles(face, &count, &file);
-    if (FAILED(hr))
-        return hr;
+    if (FAILED(hr = IDWriteFontFace_GetFiles(face, &count, &file)))
+    {
+        WARN("Failed to get font face files, hr %#lx.\n", hr);
+        TRACE("NULLREPLY: GetFontFromFontFace face files failed hr=0x%08x.\n", hr);
+        return dwrite_get_default_font(collection->factory, &IID_IDWriteFont, (void **)font);
+    }
     face_index = IDWriteFontFace_GetIndex(face);
 
     found_font = FALSE;
@@ -3392,15 +3790,28 @@ static HRESULT WINAPI dwritefontcollection_GetFontFromFontFace(IDWriteFontCollec
     }
     IDWriteFontFile_Release(file);
 
+    /* An unlisted face is resolved to the pinned default font: the caller's out-param is never
+       left NULL, whether the collection failed to match the face or the resolution itself
+       failed. */
     if (!found_font)
-        return DWRITE_E_NOFONT;
+    {
+        TRACE("NULLREPLY: GetFontFromFontFace face not found face_index=%u.\n", face_index);
+        return dwrite_get_default_font(collection->factory, &IID_IDWriteFont, (void **)font);
+    }
 
-    hr = create_fontfamily(collection, i, &family);
-    if (FAILED(hr))
-        return hr;
+    if (FAILED(hr = create_fontfamily(collection, i, &family)))
+    {
+        TRACE("NULLREPLY: GetFontFromFontFace create family failed hr=0x%08x.\n", hr);
+        return dwrite_get_default_font(collection->factory, &IID_IDWriteFont, (void **)font);
+    }
 
-    hr = create_font(family, j, (IDWriteFont3 **)font);
+    if (FAILED(hr = create_font(family, j, (IDWriteFont3 **)font)))
+    {
+        TRACE("NULLREPLY: GetFontFromFontFace create font failed hr=0x%08x.\n", hr);
+        return dwrite_get_default_font(collection->factory, &IID_IDWriteFont, (void **)font);
+    }
     IDWriteFontFamily2_Release(&family->IDWriteFontFamily2_iface);
+
     return hr;
 }
 
@@ -3455,8 +3866,14 @@ static HRESULT WINAPI dwritefontcollection1_GetFontFamily(IDWriteFontCollection3
 
     *ret = NULL;
 
+    if (!collection->count && collection->is_system)
+        fontcollection_ensure_seed_families(collection);
+
     if (index >= collection->count)
+    {
+        TRACE("NULLREPLY: collection1 GetFontFamily index OOB index=%u families=%Iu.\n", index, collection->count);
         return E_FAIL;
+    }
 
     if (SUCCEEDED(hr = create_fontfamily(collection, index, &family)))
         *ret = (IDWriteFontFamily1 *)&family->IDWriteFontFamily2_iface;
@@ -3475,8 +3892,14 @@ static HRESULT WINAPI dwritefontcollection2_GetFontFamily(IDWriteFontCollection3
 
     *ret = NULL;
 
+    if (!collection->count && collection->is_system)
+        fontcollection_ensure_seed_families(collection);
+
     if (index >= collection->count)
+    {
+        TRACE("NULLREPLY: collection2 GetFontFamily index OOB index=%u families=%Iu.\n", index, collection->count);
         return E_FAIL;
+    }
 
     if (SUCCEEDED(hr = create_fontfamily(collection, index, &family)))
         *ret = &family->IDWriteFontFamily2_iface;
@@ -3489,6 +3912,8 @@ static HRESULT WINAPI dwritefontcollection2_GetMatchingFonts(IDWriteFontCollecti
         IDWriteFontList2 **fontlist)
 {
     FIXME("%p, %s, %p, %u, %p.\n", iface, debugstr_w(familyname), axis_values, num_values, fontlist);
+
+    TRACE("NULLREPLY: collection2 GetMatchingFonts E_NOTIMPL fam=%s.\n", debugstr_w(familyname));
 
     return E_NOTIMPL;
 }
@@ -3575,6 +4000,8 @@ static void init_font_collection(struct dwrite_fontcollection *collection, IDWri
     collection->factory = factory;
     IDWriteFactory7_AddRef(collection->factory);
     collection->family_model = family_model;
+    collection->is_system = FALSE;
+    InitializeCriticalSection(&collection->cs);
 }
 
 HRESULT get_filestream_from_file(IDWriteFontFile *file, IDWriteFontFileStream **stream)
@@ -4598,15 +5025,25 @@ static BOOL fontcollection_add_replacement(struct dwrite_fontcollection *collect
         struct dwrite_fontfamily_data *replacement = collection->family_data[i];
         WCHAR nameW[255];
 
-        for (i = 0; i < replacement->count; ++i)
+        /* Only add the target family when it actually receives faces; an empty family
+           must not surface in the enumeration set. */
+        if (replacement->count)
         {
-            fontfamily_add_font(target, replacement->fonts[i]);
-            addref_font_data(replacement->fonts[i]);
-        }
+            for (i = 0; i < replacement->count; ++i)
+            {
+                fontfamily_add_font(target, replacement->fonts[i]);
+                addref_font_data(replacement->fonts[i]);
+            }
 
-        fontcollection_add_family(collection, target);
-        fontstrings_get_en_string(replacement->familyname, nameW, ARRAY_SIZE(nameW));
-        TRACE("replacement %s -> %s\n", debugstr_w(target_name), debugstr_w(nameW));
+            fontcollection_add_family(collection, target);
+            fontstrings_get_en_string(replacement->familyname, nameW, ARRAY_SIZE(nameW));
+            TRACE("replacement %s -> %s\n", debugstr_w(target_name), debugstr_w(nameW));
+        }
+        else
+        {
+            release_fontfamily_data(target);
+            TRACE("not adding empty replacement %s\n", debugstr_w(target_name));
+        }
     }
     IDWriteLocalizedStrings_Release(strings);
     return TRUE;
@@ -4781,6 +5218,8 @@ static HRESULT collection_add_font_entry(struct dwrite_fontcollection *collectio
     return hr;
 }
 
+static void fontcollection_seed_fallback_families(struct dwrite_fontcollection *collection);
+
 HRESULT create_font_collection_from_set(IDWriteFactory7 *factory, IDWriteFontSet *fontset,
         DWRITE_FONT_FAMILY_MODEL family_model, REFGUID riid, void **ret)
 {
@@ -4801,6 +5240,10 @@ HRESULT create_font_collection_from_set(IDWriteFactory7 *factory, IDWriteFontSet
     }
 
     init_font_collection(collection, factory, family_model);
+
+    /* The entry-instant read contract applies only to system collection views: custom
+       and EUDC collections keep their exact standing build behavior. */
+    collection->is_system = set->is_system;
 
     collection->set.count = set->count;
     for (i = 0; i < set->count; ++i)
@@ -4830,6 +5273,15 @@ HRESULT create_font_collection_from_set(IDWriteFactory7 *factory, IDWriteFontSet
 
         IDWriteFontFileStream_Release(stream);
     }
+
+    /* A system collection view must never report zero families: when every entry
+       failed to hydrate (dead streams in an engine restart window) or the underlying
+       set itself came back empty from the rebuild scan, the family-count view
+       collapses to "no families" for every caller walking the collection. Seed
+       catalogued fallback families materialized from a resident font file instead -
+       the collection hands out real, loadable faces under the ladder family names. */
+    if (set->is_system && !collection->count)
+        fontcollection_seed_fallback_families(collection);
 
     if (family_model == DWRITE_FONT_FAMILY_MODEL_WEIGHT_STRETCH_STYLE)
     {
@@ -4870,6 +5322,216 @@ static HRESULT create_local_file_reference(IDWriteFactory7 *factory, const WCHAR
     return hr;
 }
 
+/* Catalogued minimal family set a system collection view is seeded with when it
+   would otherwise surface with zero families (every entry failed to hydrate, or
+   the system set scan itself came back empty in an engine restart window), or
+   lazily on a read when the view is still empty at the entry instant.
+   The first nine names are the last-resort family ladder Skia's SkFontMgr_DirectWrite
+   resolves fresh-factory enumerations through; Tahoma and Microsoft Sans Serif are
+   preserved from the round-7 seed catalog (both are behind the analyzer fallback
+   routes); 'Font Awesome 6 Free' is the @font-face family name the Dr.Explain
+   preview temp resolves through - a fresh view seed never leaves its resolve-miss
+   unanswered, the family slot hands out real, loadable faces. */
+static const WCHAR *const fallback_families_catalog[] =
+{
+    L"Segoe UI",
+    L"Arial",
+    L"Times New Roman",
+    L"Trebuchet MS",
+    L"Courier New",
+    L"Calibri",
+    L"Impact",
+    L"Georgia",
+    L"Comic Sans MS",
+    L"Microsoft Sans Serif",
+    L"Tahoma",
+    L"Font Awesome 6 Free",
+};
+
+static BOOL fontcollection_seed_fallback_family(struct dwrite_fontcollection *collection,
+        IDWriteFontFile *file, IDWriteFontFileStream *stream, DWRITE_FONT_FACE_TYPE face_type,
+        UINT32 face_count, const WCHAR *name)
+{
+    struct dwrite_fontfamily_data *family_data;
+    IDWriteLocalizedStrings *familyname, *alias;
+    struct dwrite_font_data *font_data;
+    UINT32 i;
+    HRESULT hr;
+
+    if (FAILED(hr = create_localizedstrings(&familyname)))
+        return FALSE;
+
+    add_localizedstring(familyname, L"en-us", name);
+
+    hr = init_fontfamily_data(familyname, &family_data);
+    IDWriteLocalizedStrings_Release(familyname);
+    if (FAILED(hr))
+        return FALSE;
+
+    for (i = 0; i < face_count; ++i)
+    {
+        struct fontface_desc desc;
+
+        desc.factory = collection->factory;
+        desc.face_type = face_type;
+        desc.file = file;
+        desc.stream = stream;
+        desc.index = i;
+        desc.simulations = DWRITE_FONT_SIMULATIONS_NONE;
+        desc.font_data = NULL;
+
+        if (FAILED(init_font_data(&desc, collection->family_model, &font_data)))
+            continue;
+
+        /* Face-level name gate: a seed slot is the alias the collection was catalogued
+           under - every face built from it announces that exact family name the matching
+           route resolved through, not the backing file's own name, so a resolution
+           through the seeded family survives downstream case-insensitive localized-name
+           checks on the font and the face it hands out.  The face's style, weight and
+           stretch still come from the source face descriptors. */
+        alias = NULL;
+        if (FAILED(clone_localizedstrings(family_data->familyname, &alias)))
+        {
+            release_font_data(font_data);
+            continue;
+        }
+        IDWriteLocalizedStrings_Release(font_data->family_names);
+        font_data->family_names = alias;
+
+        if (FAILED(fontfamily_add_font(family_data, font_data)))
+            release_font_data(font_data);
+    }
+
+    /* A family without loadable faces must not enter the collection: its slot
+       would keep surfacing an enumeration entry whose fonts resolve to nothing
+       (the same contract as every other collection build path). */
+    if (!family_data->count)
+    {
+        release_fontfamily_data(family_data);
+        return FALSE;
+    }
+
+    hr = fontcollection_add_family(collection, family_data);
+    if (FAILED(hr))
+        release_fontfamily_data(family_data);
+
+    return SUCCEEDED(hr);
+}
+
+static void fontcollection_seed_fallback_families(struct dwrite_fontcollection *collection)
+{
+    DWRITE_FONT_FILE_TYPE file_type;
+    DWRITE_FONT_FACE_TYPE face_type;
+    IDWriteFontFileStream *stream;
+    IDWriteFontFile *file;
+    WCHAR **paths;
+    unsigned int count, i, j;
+    UINT32 face_count;
+    BOOL materialized = FALSE, added = FALSE;
+
+    if (FAILED(create_system_path_list(&paths, &count)))
+    {
+        WARN("Failed to list resident system fonts, ignoring.\n");
+        return;
+    }
+
+    /* Any resident system font file backs the materialized faces; only the family
+       names are catalogued. Each seed family materializes its faces on demand from
+       this file through the same face resolution routes as normal families. */
+    stream = NULL;
+    file = NULL;
+    for (i = 0; i < count && !materialized; ++i)
+    {
+        BOOL supported;
+
+        if (FAILED(create_local_file_reference(collection->factory, paths[i], &file)))
+            continue;
+
+        if (FAILED(get_filestream_from_file(file, &stream)))
+        {
+            IDWriteFontFile_Release(file);
+            file = NULL;
+            continue;
+        }
+
+        if (SUCCEEDED(opentype_analyze_font(stream, &supported, &file_type, &face_type, &face_count))
+                && supported && face_count)
+        {
+            materialized = TRUE;
+            TRACE("Seeding fallback families from %s (file type %u).\n", debugstr_w(paths[i]), file_type);
+        }
+        else
+        {
+            IDWriteFontFileStream_Release(stream);
+            IDWriteFontFile_Release(file);
+            stream = NULL;
+            file = NULL;
+        }
+    }
+
+    for (i = 0; i < count; ++i)
+        free(paths[i]);
+    free(paths);
+
+    if (!materialized)
+    {
+        WARN("No resident system font file to materialize fallback families from.\n");
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(fallback_families_catalog); ++i)
+    {
+        if (fontcollection_seed_fallback_family(collection, file, stream, face_type, face_count,
+                fallback_families_catalog[i]))
+            added = TRUE;
+    }
+
+    IDWriteFontFileStream_Release(stream);
+    IDWriteFontFile_Release(file);
+
+    if (added)
+        TRACE("Seeded catalogued fallback families for an empty system collection.\n");
+}
+
+/* The read-level entry-instant hydration (see the forward declaration at the collection
+   read methods): re-runs the catalogued seed fill for a still-empty system view and
+   applies the same simulated-face treatment the build path gives its families.  Runs
+   under the collection section, which serializes concurrent fresh-view readers. */
+static void fontcollection_ensure_seed_families(struct dwrite_fontcollection *collection)
+{
+    size_t i;
+    WCHAR famname[255];
+
+    EnterCriticalSection(&collection->cs);
+
+    /* double-check under the section: a concurrent reader may have hydrated meanwhile */
+    if (!collection->count)
+    {
+        fontcollection_seed_fallback_families(collection);
+
+        if (collection->count)
+        {
+            if (collection->family_model == DWRITE_FONT_FAMILY_MODEL_WEIGHT_STRETCH_STYLE)
+            {
+                for (i = 0; i < collection->count; ++i)
+                {
+                    fontfamily_add_bold_simulated_face(collection->family_data[i]);
+                    fontfamily_add_oblique_simulated_face(collection->family_data[i]);
+                }
+            }
+
+            for (i = 0; i < collection->count; ++i)
+                TRACE("SEEDFILL: fam=%s.\n", debugstr_w(fontfamily_name_for_trace(collection->family_data[i], famname)));
+
+            TRACE("Hydrated catalogued seed families on read, %Iu families.\n", collection->count);
+        }
+
+        TRACE("SEEDFILL: families=%Iu.\n", collection->count);
+    }
+
+    LeaveCriticalSection(&collection->cs);
+}
+
 HRESULT get_system_fontcollection(IDWriteFactory7 *factory, DWRITE_FONT_FAMILY_MODEL family_model,
         IDWriteFontCollection **collection)
 {
@@ -4885,6 +5547,290 @@ HRESULT get_system_fontcollection(IDWriteFactory7 *factory, DWRITE_FONT_FAMILY_M
     }
 
     return hr;
+}
+
+static HRESULT fontset_create_entry(IDWriteFontFile *file, DWRITE_FONT_FACE_TYPE face_type,
+        unsigned int face_index, unsigned int simulations, struct dwrite_fontset_entry **ret);
+
+/* The fresh-factory entry-instant hydration for the FACTORY system table: resolves the
+   first loadable resident system font file and materializes one fontset entry per face
+   of it, away from the factory table (same contract as the rebuild).  create_system_fontset
+   installs the content when a fresh factory's build/rebuild attempt has left its standing
+   table empty - the pre-build site of the first GetSystemFontCollection fetch serves a
+   hydrated table instead of an empty one.  The caller owns the returned entries. */
+HRESULT system_fontset_seed_entries(IDWriteFactory7 *factory, struct dwrite_fontset_entry ***ret,
+        unsigned int *ret_count)
+{
+    struct dwrite_fontset_entry **entries;
+    DWRITE_FONT_FILE_TYPE file_type;
+    DWRITE_FONT_FACE_TYPE face_type;
+    IDWriteFontFileStream *stream;
+    IDWriteFontFile *file;
+    WCHAR **paths;
+    unsigned int i, count, entry_count;
+    UINT32 face_count;
+    BOOL materialized = FALSE;
+    HRESULT hr = S_OK;
+
+    *ret = NULL;
+    *ret_count = 0;
+
+    if (FAILED(create_system_path_list(&paths, &count)))
+    {
+        WARN("Failed to list resident system fonts, ignoring.\n");
+        TRACE("NULLREPLY: system fontset seed no path list.\n");
+        return E_UNEXPECTED;
+    }
+
+    stream = NULL;
+    file = NULL;
+    for (i = 0; i < count && !materialized; ++i)
+    {
+        BOOL supported;
+
+        if (FAILED(create_local_file_reference(factory, paths[i], &file)))
+            continue;
+
+        if (FAILED(get_filestream_from_file(file, &stream)))
+        {
+            IDWriteFontFile_Release(file);
+            file = NULL;
+            continue;
+        }
+
+        if (SUCCEEDED(opentype_analyze_font(stream, &supported, &file_type, &face_type, &face_count))
+                && supported && face_count)
+        {
+            materialized = TRUE;
+            TRACE("Hydrating the fresh factory system table from %s (file type %u).\n",
+                    debugstr_w(paths[i]), file_type);
+        }
+        else
+        {
+            IDWriteFontFileStream_Release(stream);
+            IDWriteFontFile_Release(file);
+            stream = NULL;
+            file = NULL;
+        }
+    }
+
+    for (i = 0; i < count; ++i)
+        free(paths[i]);
+    free(paths);
+
+    if (!materialized)
+    {
+        WARN("No resident loadable system font file to hydrate the fresh factory system table from.\n");
+        TRACE("NULLREPLY: system fontset seed no materialized file.\n");
+        return E_FAIL;
+    }
+
+    if (!(entries = calloc(face_count, sizeof(*entries))))
+    {
+        IDWriteFontFileStream_Release(stream);
+        IDWriteFontFile_Release(file);
+        return E_OUTOFMEMORY;
+    }
+
+    entry_count = 0;
+    for (i = 0; i < face_count; ++i)
+    {
+        struct dwrite_fontset_entry *entry;
+
+        if (FAILED(hr = fontset_create_entry(file, face_type, i, DWRITE_FONT_SIMULATIONS_NONE, &entry)))
+            break;
+        entries[entry_count++] = entry;
+    }
+
+    IDWriteFontFileStream_Release(stream);
+    IDWriteFontFile_Release(file);
+
+    if (FAILED(hr) || !entry_count)
+    {
+        TRACE("NULLREPLY: system fontset seed entries failed entr=%u hr=0x%08x.\n", entry_count, FAILED(hr) ? hr : E_FAIL);
+        for (i = 0; i < entry_count; ++i)
+            release_fontset_entry(entries[i]);
+        free(entries);
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+
+    *ret = entries;
+    *ret_count = entry_count;
+
+    TRACE("SEEDFILL: entr=%u.\n", entry_count);
+
+    return S_OK;
+}
+
+/* Process-wide pinned default font used by font resolution routes: whenever a requested family,
+   face or font can't be resolved, routes hand this object out with S_OK instead of leaving a
+   NULL out-param behind.  A failed call paired with a NULL out-param is what passes the NULL
+   carrier on to callers that don't check the status; "no font" resolves to the default font
+   instead.  The default font is created lazily as the first face of the wine default system
+   family (Segoe UI), or the lowest-index family when it's absent, and pinned for the process
+   lifetime by never releasing the references: the font references its family, the family
+   references the collection, and the collection references the originating factory, so engine
+   teardown bursts cannot dispose of the default under a caller's feet. */
+static const WCHAR default_font_family_name[] = L"Segoe UI";
+static INIT_ONCE init_default_font_once = INIT_ONCE_STATIC_INIT;
+static struct dwrite_fontfamily *default_fontfamily; /* pinned for the process lifetime */
+static struct dwrite_font *default_font;             /* pinned for the process lifetime */
+
+static BOOL default_font_from_family(struct dwrite_fontcollection *collection, UINT32 index,
+        struct dwrite_fontfamily **out_family, IDWriteFont3 **out_font)
+{
+    struct dwrite_fontfamily *family;
+    IDWriteFont3 *font;
+
+    if (FAILED(create_fontfamily(collection, index, &family)))
+        return FALSE;
+
+    if (!family->data->count || FAILED(create_font(family, 0, &font)))
+    {
+        IDWriteFontFamily2_Release(&family->IDWriteFontFamily2_iface);
+        return FALSE;
+    }
+
+    *out_family = family;
+    *out_font = font;
+    return TRUE;
+}
+
+/* Particular factory instance used for the initial build is not important: the pin keeps it
+   alive for the process lifetime. */
+static BOOL WINAPI default_font_initonce(INIT_ONCE *once, void *param, void **context)
+{
+    struct dwrite_fontcollection *collection;
+    struct dwrite_fontfamily *family = NULL;
+    IDWriteFontCollection3 *collection3;
+    IDWriteFont3 *font = NULL;
+    BOOL exists = FALSE, found = FALSE;
+    UINT32 index, i;
+    HRESULT hr;
+
+    if (FAILED(hr = get_system_fontcollection(param, DWRITE_FONT_FAMILY_MODEL_TYPOGRAPHIC,
+            (IDWriteFontCollection **)&collection3)))
+    {
+        WARN("Failed to get system font collection, hr %#lx.\n", hr);
+        return FALSE;
+    }
+
+    collection = impl_from_IDWriteFontCollection3(collection3);
+
+    if (SUCCEEDED(IDWriteFontCollection3_FindFamilyName(collection3, default_font_family_name, &index, &exists)) && exists)
+        found = default_font_from_family(collection, index, &family, &font);
+
+    for (i = 0; !found && i < collection->count; ++i)
+        found = default_font_from_family(collection, i, &family, &font);
+
+    IDWriteFontCollection3_Release(collection3);
+
+    if (!found)
+    {
+        WARN("No family with a loadable font found for the default font.\n");
+        return FALSE;
+    }
+
+    /* Pin: these references are kept for the process lifetime, never released. */
+    default_fontfamily = family;
+    default_font = impl_from_IDWriteFont3(font);
+
+    return TRUE;
+}
+
+static HRESULT default_font_pin(IDWriteFactory7 *factory)
+{
+    if (!InitOnceExecuteOnce(&init_default_font_once, default_font_initonce, factory, NULL))
+    {
+        WARN("Failed to pin the default font.\n");
+        return DWRITE_E_NOFONT;
+    }
+
+    return S_OK;
+}
+
+HRESULT dwrite_get_default_font(IDWriteFactory7 *factory, REFIID riid, void **obj)
+{
+    HRESULT hr;
+
+    if (FAILED(hr = default_font_pin(factory)))
+        return hr;
+
+    return IDWriteFont3_QueryInterface(&default_font->IDWriteFont3_iface, riid, obj);
+}
+
+HRESULT dwrite_get_default_fontfamily(IDWriteFactory7 *factory, REFIID riid, void **obj)
+{
+    HRESULT hr;
+
+    if (FAILED(hr = default_font_pin(factory)))
+        return hr;
+
+    return IDWriteFontFamily2_QueryInterface(&default_fontfamily->IDWriteFontFamily2_iface, riid, obj);
+}
+
+static INIT_ONCE init_default_fontface_once = INIT_ONCE_STATIC_INIT;
+static struct dwrite_fontface *default_fontface; /* pinned for the process lifetime */
+
+static BOOL WINAPI default_fontface_initonce(INIT_ONCE *once, void *param, void **context)
+{
+    struct dwrite_fontface *fontface;
+    IDWriteFontFace5 *fontface5;
+    HRESULT hr;
+
+    if (FAILED(hr = get_fontface_from_font(default_font, &fontface5)))
+    {
+        WARN("Failed to create the default font face, hr %#lx.\n", hr);
+        return FALSE;
+    }
+
+    fontface = impl_from_IDWriteFontFace5(fontface5);
+
+    /* Pin the ft face object together with the wrapper: the pinned carrier backs every
+       face use that would otherwise dereference object 0 (a wrapper whose ft face failed
+       to build), and it is never released for the process lifetime - any family whose
+       resolution reaches a dead carrier hands this object out, and the carrier stays
+       alive through teardown bursts because the object itself is pinned. */
+    if (!dwrite_fontface_check_font_object(&fontface->IDWriteFontFace5_iface))
+    {
+        WARN("Failed to materialize the default font face object.\n");
+        IDWriteFontFace5_Release(fontface5);
+        return FALSE;
+    }
+
+    default_fontface = fontface;
+    return TRUE;
+}
+
+HRESULT dwrite_get_default_fontface(IDWriteFactory7 *factory, REFIID riid, void **obj)
+{
+    HRESULT hr;
+
+    if (FAILED(hr = default_font_pin(factory)))
+        return hr;
+
+    if (!InitOnceExecuteOnce(&init_default_fontface_once, default_fontface_initonce, factory, NULL))
+    {
+        WARN("Failed to pin the default font face.\n");
+        return DWRITE_E_NOFONT;
+    }
+
+    return IDWriteFontFace5_QueryInterface(&default_fontface->IDWriteFontFace5_iface, riid, obj);
+}
+
+/* The ft face object a face use computes against: a wrapper whose ft face object failed to
+   build would be dereferenced with object 0 inside the ft layer on every metric or glyph
+   call.  A face use that reaches a dead carrier resolves it to the family's pinned face
+   object instead - the process default face materialized at pin time and never released,
+   so the object handed to the ft layer is always valid, never a stale pointer. */
+static UINT64 fontface_font_object_or_default(struct dwrite_fontface *fontface)
+{
+    UINT64 object = fontface->get_font_object(fontface);
+
+    if (!object && default_fontface)
+        object = default_fontface->get_font_object(default_fontface);
+
+    return object;
 }
 
 static HRESULT eudc_collection_add_family(IDWriteFactory7 *factory, struct dwrite_fontcollection *collection,
@@ -4961,6 +5907,16 @@ static HRESULT eudc_collection_add_family(IDWriteFactory7 *factory, struct dwrit
     }
 
     /* add family to collection */
+    /* A family that ended up without any loadable face must never enter the collection:
+       its slot would keep surfacing an enumeration entry whose fonts resolve to nothing. */
+    if (!family_data->count)
+    {
+        release_fontfamily_data(family_data);
+        IDWriteFontFileStream_Release(stream);
+        IDWriteFontFile_Release(file);
+        return S_FALSE;
+    }
+
     hr = fontcollection_add_family(collection, family_data);
     if (FAILED(hr))
         release_fontfamily_data(family_data);
@@ -5304,8 +6260,20 @@ HRESULT create_fontface(const struct fontface_desc *desc, struct list *cached_li
     IDWriteFontFileStream_AddRef(fontface->cmap.stream);
     release_font_data(font_data);
 
-    fontface->cached = factory_cache_fontface(fontface->factory, cached_list, &fontface->IDWriteFontFace5_iface);
+    /* Resolution-time face materialization: the wrapper materializes its ft face object
+       before it enters a cached slot or reaches a caller, so a resolution reports a face
+       whose object actually exists.  A wrapper whose ft face failed to build (invalid
+       file, dead stream) would carry object 0 into every metric or glyph call - report
+       the failure to the resolution routes, which hand the family's pinned face object
+       out instead of a dead carrier. */
     fontface->get_font_object = dwrite_fontface_get_font_object;
+    if (!fontface->get_font_object(fontface))
+    {
+        IDWriteFontFace5_Release(&fontface->IDWriteFontFace5_iface);
+        return DWRITE_E_NOFONT;
+    }
+
+    fontface->cached = factory_cache_fontface(fontface->factory, cached_list, &fontface->IDWriteFontFace5_iface);
 
     *ret = &fontface->IDWriteFontFace5_iface;
 
@@ -6625,17 +7593,17 @@ static HRESULT WINAPI fontfacereference_CreateFontFaceWithSimulations(IDWriteFon
 
     TRACE("%p, %#x, %p.\n", iface, simulations, ret);
 
-    hr = IDWriteFontFile_Analyze(reference->file, &is_supported, &file_type, &face_type, &face_num);
-    if (FAILED(hr))
-        return hr;
+    if (FAILED(hr = IDWriteFontFile_Analyze(reference->file, &is_supported, &file_type, &face_type, &face_num)))
+        return dwrite_get_default_fontface(reference->factory, &IID_IDWriteFontFace3, (void **)ret);
 
-    hr = IDWriteFactory7_CreateFontFace(reference->factory, face_type, 1, &reference->file, reference->index,
-            simulations, &fontface);
-    if (SUCCEEDED(hr))
+    if (FAILED(hr = IDWriteFactory7_CreateFontFace(reference->factory, face_type, 1, &reference->file, reference->index,
+            simulations, &fontface)))
     {
-        hr = IDWriteFontFace_QueryInterface(fontface, &IID_IDWriteFontFace3, (void **)ret);
-        IDWriteFontFace_Release(fontface);
+        return dwrite_get_default_fontface(reference->factory, &IID_IDWriteFontFace3, (void **)ret);
     }
+
+    hr = IDWriteFontFace_QueryInterface(fontface, &IID_IDWriteFontFace3, (void **)ret);
+    IDWriteFontFace_Release(fontface);
 
     return hr;
 }
@@ -6775,6 +7743,9 @@ static HRESULT WINAPI fontfacereference1_CreateFontFace(IDWriteFontFaceReference
         hr = IDWriteFontFace3_QueryInterface(fontface3, &IID_IDWriteFontFace5, (void **)fontface);
         IDWriteFontFace3_Release(fontface3);
     }
+
+    if (FAILED(hr))
+        return dwrite_get_default_fontface(reference->factory, &IID_IDWriteFontFace5, (void **)fontface);
 
     return hr;
 }
@@ -7640,6 +8611,9 @@ static HRESULT WINAPI dwritefontset_GetMatchingFonts_(IDWriteFontSet3 *iface, WC
 {
     FIXME("%p, %s, %d, %d, %d, %p.\n", iface, debugstr_w(family), weight, stretch, style, fontset);
 
+    TRACE("NULLREPLY: fontset GetMatchingFonts E_NOTIMPL fam=%s weight=%d stretch=%d style=%d.\n",
+            debugstr_w(family), weight, stretch, style);
+
     return E_NOTIMPL;
 }
 
@@ -7675,6 +8649,8 @@ static HRESULT WINAPI dwritefontset_GetMatchingFonts(IDWriteFontSet3 *iface, DWR
 
     if (!matched_count)
     {
+        TRACE("NULLREPLY: fontset GetMatchingFonts empty nset=%u nprops=%u fam=%s.\n", set->count, count,
+                debugstr_w(props && count ? props[0].propertyValue : NULL));
         free(entries);
         entries = NULL;
     }
@@ -7690,6 +8666,8 @@ static HRESULT WINAPI dwritefontset1_GetMatchingFonts(IDWriteFontSet3 *iface, DW
         DWRITE_FONT_AXIS_VALUE const *axis_values, UINT32 num_values, IDWriteFontSet1 **fontset)
 {
     FIXME("%p, %p, %p, %u, %p.\n", iface, property, axis_values, num_values, fontset);
+
+    TRACE("NULLREPLY: fontset1 GetMatchingFonts E_NOTIMPL.\n");
 
     return E_NOTIMPL;
 }
