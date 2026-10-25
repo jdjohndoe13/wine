@@ -1425,9 +1425,6 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
     {
         /* Track-3 v3: the WM already refused this exact config; re-requesting re-fires
          * the geometry war. Converge the X-side state to the delivered config instead. */
-        WARN( "Track-3 v3: window %p/%lx suppressing re-request of refused config %s (round %u)\n",
-              data->hwnd, data->whole_window, wine_dbgstr_rect( new_rect ),
-              data->config_refuse_count );
         data->config_refuse_count++;
         data->desired_state.rect = data->current_state.rect;
         data->pending_state.rect = data->current_state.rect;
@@ -1578,6 +1575,24 @@ static void set_xembed_flags( struct x11drv_win_data *data, unsigned long flags 
     info[1] = flags;
     XChangeProperty( data->display, data->whole_window, x11drv_atom(_XEMBED_INFO),
                      x11drv_atom(_XEMBED_INFO), 32, PropModeReplace, (unsigned char*)info, 2 );
+}
+
+/* W13: is this window a child whose parent belongs to another process?
+ * (the WebView2 canvas case: the canvas is reparented under the foreign
+ * host toplevel and its X window lives in the child's own process driver).
+ * Same-process windows and toplevels return FALSE so their behavior is
+ * untouched. Both NtUserGetWindowThread queries are server-backed and
+ * work for foreign windows too. */
+static BOOL is_cross_process_child( HWND hwnd )
+{
+    HWND parent;
+    DWORD own_pid = 0, parent_pid = 0;
+
+    if (!(parent = NtUserGetAncestor( hwnd, GA_PARENT ))) return FALSE;  /* desktop */
+    if (parent == NtUserGetDesktopWindow()) return FALSE;  /* toplevel */
+    if (!NtUserGetWindowThread( hwnd, &own_pid )) return FALSE;
+    if (!NtUserGetWindowThread( parent, &parent_pid )) return FALSE;
+    return own_pid != parent_pid;
 }
 
 static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, BOOL activate )
@@ -3372,6 +3387,26 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     {
         release_win_data( data );
         return;
+    }
+
+    /* W13: a reparented cross-process child (the WebView2 canvas) keeps its own
+     * X window under the foreign host toplevel; msedge's async put_IsVisible
+     * race re-shows it with its own WS_VISIBLE flag still set even when the
+     * host (or any ancestor) has been hidden, so it stays mapped and occludes
+     * the app content. When the window is not effectively visible (own flag
+     * AND all ancestors, per the win32u/server NtUserIsWindowVisible), force
+     * the unmap path by clearing the WS_VISIBLE bit we map on. Only applies
+     * to cross-process children; same-process windows and toplevels are
+     * untouched. Placed after the delay heuristics above so it overrides them. */
+    if (is_cross_process_child( hwnd ))
+    {
+        BOOL own_vis = !!(new_style & WS_VISIBLE);
+        BOOL eff_vis = NtUserIsWindowVisible( hwnd );
+
+        if (own_vis && !eff_vis)
+        {
+            new_style &= ~WS_VISIBLE;
+        }
     }
 
     /* Hack (CW-Bug-Id #26914 parity, Valve 09ab0e2ebcee): withdraw before XReconfigureWMWindow() to avoid a Mutter Wayland _XWAYLAND_ALLOW_COMMITS freeze. */

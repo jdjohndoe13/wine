@@ -1261,6 +1261,19 @@ static inline struct window *get_top_clipping_window( struct window *win )
 static struct region *clip_cross_process_children( struct window *parent, struct region *region,
                                                    int offset_x, int offset_y );
 
+/* W13v2: forward declaration of the hole-invalidate helper (defined below
+ * has_cross_process_descendant, used by expose_window) */
+static struct region *add_cross_process_descendant_rects( struct window *parent, struct region *region,
+                                                          int offset_x, int offset_y );
+
+/* W13v4: forward declaration of the descendant-hole predicate (defined below
+ * expose_window, used by expose_window) */
+static int has_cross_process_descendant( struct window *parent, struct process *process );
+
+/* W16: forward declaration of the style-visibility side-effect helper (defined
+ * below the cross-process helpers, used by set_window_info) */
+static void style_visibility_changed( struct window *win, unsigned int old_style, bool old_eff );
+
 /* compute the visible region of a window, in window coordinates */
 static struct region *get_visible_region( struct window *win, unsigned int flags )
 {
@@ -1349,6 +1362,20 @@ error:
 }
 
 
+/* W13: minimal rectangle formatter for the DRX-W13 traces (no debugstr in
+ * the server); single-threaded request handling makes the static buffer safe. */
+static const char *rect_str( const struct rectangle *rect )
+{
+    static char buffer[6][32];
+    static int count;
+
+    count = (count + 1) % 6;
+    snprintf( buffer[count], sizeof(buffer[count]), "%d,%d,%d,%d",
+              rect->left, rect->top, rect->right, rect->bottom );
+    return buffer[count];
+}
+
+
 /* clip all cross-process descendants out of the visible region.
  *
  * A child owned by a different process can never share the parent's window surface
@@ -1383,6 +1410,9 @@ static struct region *clip_cross_process_children( struct window *parent, struct
             if (ptr->win_region && !intersect_window_region( tmp, ptr )) break;
             offset_region( tmp, offset_x, offset_y );
             if (!(region = subtract_region( region, region, tmp ))) break;
+            fprintf( stderr, "DRX-W13 hole top=%x child=%x host_vis=%d child_vis=%d rect=%s\n",
+                     parent->handle, ptr->handle, is_visible( parent ), is_visible( ptr ),
+                     rect_str( &ptr->visible_rect ) );
             if (is_region_empty( region )) break;
         }
         else if (!is_region_empty( region ))
@@ -1465,6 +1495,14 @@ static struct region *get_surface_region( struct window *win )
     else offset_x = offset_y = 0;
 
     if (!clip_pixel_format_children( win, clip, region, offset_x, offset_y )) goto error;
+
+    /* W11: subtract cross-process children from the surface clip too. The app's
+     * window_surface_flush pushes the surface's bytes (stale white under the canvas,
+     * which is never presented into the surface) via ONE PutImage onto the shared
+     * toplevel drawable; the GC clip derived from this region is the only choke point
+     * that can protect the foreign child's pixels. The W9 clip covers the DC-write
+     * path (get_visible_region) but not this one. */
+    if (!(region = clip_cross_process_children( win, region, offset_x, offset_y ))) goto error;
 
     free_region( clip );
     return region;
@@ -1978,6 +2016,18 @@ static struct region *expose_window( struct window *win, const struct rectangle 
         {
             if (!is_region_empty( new_vis_rgn ))
             {
+                /* W13v2: the old visible region above was computed with the W9
+                 * clip applied, so the cross-process child's hole rect was
+                 * already subtracted from it and the exposed area never covers
+                 * the former hole — the parent never repaints the former canvas
+                 * area and the stale surface bits survive. Union the hole rects
+                 * back in (in this window's own coord space, same as the region
+                 * here; the child's visible_rect is in our client coords, so
+                 * map client->window with the non-client offset) before the
+                 * region is moved to parent coords for the invalidation. */
+                add_cross_process_descendant_rects( win, new_vis_rgn,
+                                                    win->client_rect.left - win->window_rect.left,
+                                                    win->client_rect.top - win->window_rect.top );
                 /* make it relative to parent */
                 offset_region( new_vis_rgn, old_window_rect->left, old_window_rect->top );
                 redraw_window( win->parent, new_vis_rgn, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
@@ -2519,6 +2569,9 @@ DECL_HANDLER(set_window_info)
 {
     struct window *win;
     bool ansi;
+    unsigned int old_style = 0;
+    bool old_eff = false;
+    int vis_flip = 0;
 
     if (!(win = get_window( req->handle ))) return;
     if (is_desktop_window( win ) && win->thread != current)
@@ -2533,6 +2586,9 @@ DECL_HANDLER(set_window_info)
         {
         case GWL_STYLE:
             reply->old_info = win->style;
+            old_style = win->style;
+            old_eff = is_visible( win );
+            vis_flip = ((win->style ^ req->new_info) & WS_VISIBLE) != 0;
             win->style = req->new_info;
             fix_window_ex_style( win );
             /* changing window style triggers a non-client paint */
@@ -2576,6 +2632,12 @@ DECL_HANDLER(set_window_info)
         }
     }
     SHARED_WRITE_END;
+
+    /* W16: the client's parent-invisible fast path (dlls/win32u/window.c
+     * show_window) applies WS_VISIBLE flips here instead of going through
+     * set_window_pos, so the hole-clip and the W12/W13 posts never run.
+     * Re-run the visibility side effects for a WS_VISIBLE flip. */
+    if (vis_flip) style_visibility_changed( win, old_style, old_eff );
 }
 
 
@@ -2752,14 +2814,183 @@ DECL_HANDLER(get_window_tree)
 }
 
 
+/* W12: does the window have a visible cross-process descendant? Mirrors the
+ * predicate of the W9 clip clip_cross_process_children(): visible, non-transparent
+ * children; a cross-process child is the hole itself (return found), recursion
+ * continues through same-process children only (the WebView2 nesting case). */
+static int has_cross_process_descendant( struct window *parent, struct process *process )
+{
+    struct window *ptr;
+
+    LIST_FOR_EACH_ENTRY( ptr, &parent->children, struct window, entry )
+    {
+        if (!(ptr->style & WS_VISIBLE)) continue;
+        if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
+        if (ptr->thread->process != process) return 1;
+        if (has_cross_process_descendant( ptr, process )) return 1;
+    }
+    return 0;
+}
+
+
+/* W13v2: post WM_WINE_UPDATEWINDOWSTATE to each visible cross-process descendant
+ * of the window itself, not just to the toplevel. The canvas's (the WebView2
+ * window's) win32 side never gets a position/visibility message in the msedge
+ * process when the host (in the app's process) hides/shows, so the W13 driver
+ * gate in X11DRV_WindowPosChanged never fires on the canvas's own thread.
+ * Posting to the descendant's own handle runs the same consumer as the top
+ * post (win32u/message.c WM_WINE_UPDATEWINDOWSTATE -> update_window_state ->
+ * apply_window_pos -> X11DRV_WindowPosChanged): on hide the driver's
+ * own_vis && !eff_vis force-unmap path runs (Withdrawn -> XUnmapWindow); on
+ * show the normal path re-maps (the forced unmap recorded pending_state =
+ * Withdrawn, so the next NormalState request does XMapWindow). Same subtree
+ * walk as has_cross_process_descendant(): the cross-process child is the hole
+ * itself, its own subtree is foreign and not descended into. */
+static void post_to_cross_process_descendants( struct window *parent, struct process *process )
+{
+    struct window *ptr;
+
+    LIST_FOR_EACH_ENTRY( ptr, &parent->children, struct window, entry )
+    {
+        if (!(ptr->style & WS_VISIBLE)) continue;
+        if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
+        if (ptr->thread->process != process)
+        {
+            fprintf( stderr, "DRX-W13 post_child %x\n", ptr->handle );
+            post_message( ptr->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+            continue;
+        }
+        post_to_cross_process_descendants( ptr, process );
+    }
+}
+
+
+/* W13v2: union the visible rects of the visible cross-process descendants into
+ * the region (same parent-relative coordinates the region is in), mirroring the
+ * subtree walk of clip_cross_process_children(). The expose path computes the
+ * hidden window's old visible region with the W9 clip already applied, so the
+ * hole (the canvas's area) was subtracted from it and the parent invalidation
+ * below never covers the former hole rect — the toplevel never repaints the
+ * former canvas area and the stale surface bits survive. Unioning the hole
+ * rect into the parent's invalidation region makes the content editor repaint
+ * it; the W11 surface-clip hole is closed by then (the host's WS_VISIBLE is
+ * cleared, so the W9/W11 walk stops at the hidden host), so the surface flush
+ * re-presents the freshly painted pixels. */
+static struct region *add_cross_process_descendant_rects( struct window *parent, struct region *region,
+                                                          int offset_x, int offset_y )
+{
+    struct window *ptr;
+    struct region *tmp = create_empty_region();
+
+    if (!tmp) return region;
+    LIST_FOR_EACH_ENTRY( ptr, &parent->children, struct window, entry )
+    {
+        if (!(ptr->style & WS_VISIBLE)) continue;
+        if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
+
+        if (ptr->thread->process != parent->thread->process)
+        {
+            /* a foreign-process child: the hole itself, union its rect, stop descending */
+            set_region_rect( tmp, &ptr->visible_rect );
+            if (ptr->win_region && !intersect_window_region( tmp, ptr )) break;
+            offset_region( tmp, offset_x, offset_y );
+            if (!union_region( region, region, tmp )) break;
+            fprintf( stderr, "DRX-W13 hole_invalidate %x rect %s\n",
+                     ptr->handle, rect_str( &ptr->visible_rect ) );
+        }
+        else if (!is_region_empty( region ))
+        {
+            /* same process: keep looking for nested cross-process children */
+            if (!add_cross_process_descendant_rects( ptr, region,
+                     offset_x + ptr->client_rect.left, offset_y + ptr->client_rect.top ))
+                break;
+        }
+    }
+    free_region( tmp );
+    return region;
+}
+
+/* W16: the client's parent-invisible fast path (dlls/win32u/window.c
+ * show_window: "if parent is not visible simply toggle WS_VISIBLE and
+ * return") applies WS_VISIBLE flips via set_window_info, which only writes
+ * the style field — the hole-clip recompute, the W12/W13 wake posts and the
+ * W13v4 parent invalidation never run. The toplevel's surface GC-clip then
+ * keeps the (now invisible) cross-process canvas's rect subtracted forever,
+ * the app's own paint of the former canvas area is clipped out of the very
+ * area it must repaint, and the never-presented black X background
+ * (background_pixel = 0) is revealed. Mirror the set_window_pos handler's
+ * visibility side effects here, keyed on the own-style flip (the effective
+ * visibility of these windows is already false — the parent is hidden — so
+ * eff_diff alone is blind to them). */
+static void style_visibility_changed( struct window *win, unsigned int old_style, bool old_eff )
+{
+    struct window *top;
+    struct region *hole;
+    int cross, eff_diff, own_show, own_hide, post;
+
+    if (is_desktop_window( win ) || !win->parent) return;
+    top = get_top_clipping_window( win );
+    cross = (top->thread->process != win->thread->process);
+    eff_diff = is_visible( win ) != old_eff;
+    own_show = !(old_style & WS_VISIBLE) && (win->style & WS_VISIBLE);
+    own_hide = (old_style & WS_VISIBLE) && !(win->style & WS_VISIBLE);
+
+    /* same gate as the set_window_pos handler, rect_diff ≡ 0 here, extended
+     * with the own-style flip legs (the fast path never reaches the
+     * set_window_pos handler, so the W12/W13 posts must run here) */
+    post = (cross && (top->paint_flags & PAINT_HAS_SURFACE) && is_visible( top ) &&
+            (eff_diff || own_show)) ||
+           (!cross && (top->paint_flags & PAINT_HAS_SURFACE) && (eff_diff || own_hide) &&
+            has_cross_process_descendant( win, win->thread->process ));
+    if (post) post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+    if (own_show && cross) post_message( win->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+    if (post) post_to_cross_process_descendants( win, win->thread->process );
+
+    /* W13v4 mirror: the hide of a window that hides a cross-process
+     * descendant — invalidate the former hole on the toplevel so the app's
+     * own window repaints it. The hole is measured from the window's own
+     * client rect (the canvas's visible_rect is still in the server's truth
+     * when the host's own hide arrives first). */
+    if (!is_toplevel( win ) && !is_visible( win ) && own_hide &&
+        has_cross_process_descendant( win, win->thread->process ))
+    {
+        if ((hole = create_empty_region()))
+        {
+            add_cross_process_descendant_rects( win, hole,
+                                                win->client_rect.left - win->window_rect.left,
+                                                win->client_rect.top - win->window_rect.top );
+            if (!is_region_empty( hole ))
+            {
+                fprintf( stderr, "DRX-W16 hide_invalidate %x\n", win->handle );
+                /* W17: wake the toplevel's client so update_surface_region()
+                 * removes the stale GC-clip hole before the redraw below
+                 * repaints through the restored clip (queued first, so the
+                 * post runs ahead of the lazy WM_PAINT). */
+                if (top->paint_flags & PAINT_HAS_SURFACE)
+                {
+                    fprintf( stderr, "DRX-W17 hole_wake %x top %x\n", win->handle, top->handle );
+                    post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+                }
+                offset_region( hole, win->window_rect.left, win->window_rect.top );
+                redraw_window( win->parent, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
+            }
+            free_region( hole );
+        }
+    }
+    fprintf( stderr, "DRX-W16 style_vis %x top %x vis_top %d vis_win %d old_eff %d cross %d post %d\n",
+             win->handle, top->handle, is_visible( top ), is_visible( win ),
+             old_eff, cross, post );
+}
+
 /* set the position and Z order of a window */
 DECL_HANDLER(set_window_pos)
 {
-    struct rectangle window_rect, client_rect, visible_rect, surface_rect, valid_rect, old_window, old_client;
+    struct rectangle window_rect, client_rect, visible_rect, surface_rect, valid_rect, old_window, old_client, old_visible;
     const struct rectangle *extra_rects = get_req_data();
     struct window *previous = NULL;
     struct window *top, *win = get_window( req->handle );
     unsigned int flags = req->swp_flags, old_style;
+    int old_effective, cross, rect_diff, eff_diff, post, own_show;
 
     if (!win) return;
     if (!win->parent) flags |= SWP_NOZORDER;  /* no Z order for the desktop */
@@ -2826,6 +3057,8 @@ DECL_HANDLER(set_window_pos)
     old_style = win->style;
     old_window = win->window_rect;
     old_client = win->client_rect;
+    old_visible = win->visible_rect;
+    old_effective = is_visible( win );  /* W12: effective visibility incl. ancestors */
     set_window_pos( win, previous, flags, &window_rect, &client_rect,
                     &visible_rect, &surface_rect, &valid_rect );
     if ((win->style & old_style & WS_VISIBLE) && (memcmp( &old_client, &win->client_rect, sizeof(old_client) )
@@ -2839,6 +3072,96 @@ DECL_HANDLER(set_window_pos)
 
     top = get_top_clipping_window( win );
     if (is_visible( top ) && (top->paint_flags & PAINT_HAS_SURFACE)) reply->surface_win = top->handle;
+
+    /* W12: the surface clip's hole depends on the cross-process descendant's
+     * visible rect and on the effective visibility of the window (a same-process
+     * parent host window hiding/showing also opens/closes the hole for its
+     * cross-process child, e.g. the WebView2 window). Post when either leg
+     * changed:
+     *  (a) win itself is cross-process to the top (the W11b case): rect or
+     *      effective visibility changed, top must still be visible (the child
+     *      needs the hole while it is on screen);
+     *  (b) win is same-process as the top but has a cross-process descendant
+     *      whose hole must be REMOVED when win goes hidden: the effective
+     *      visibility of win changed — note is_visible(top) must NOT be
+     *      required here, the hide-leg post is exactly what unmaps the
+     *      foreign X window when the top is no longer visible. */
+    cross = (top->thread->process != win->thread->process);
+    rect_diff = memcmp( &old_visible, &win->visible_rect, sizeof(old_visible) );
+    eff_diff = is_visible( win ) != old_effective;
+    /* W15b: the escape event — the window's OWN WS_VISIBLE flips hidden->visible
+     * while it stays effectively hidden (the app-side ancestor chain is hidden).
+     * This is the cross-process re-show (Chromium's async put_IsVisible /
+     * re-parent+re-show under the hidden host): eff_diff is false — effective
+     * visibility does not change — so the W12 gate is blind to it, and the
+     * client's normal path re-maps the window's own X window (the canvas
+     * whole_window: never-presented black background) and X input follows the
+     * mapped window. The server cannot refuse the flag (the app's ShowWindow
+     * return value and the client's own style checks must stay truthful); the
+     * fix is to wake the window's own driver gate at this exact moment. */
+    own_show = !(old_style & WS_VISIBLE) && (win->style & WS_VISIBLE) && !is_visible( win );
+    post = (cross && (top->paint_flags & PAINT_HAS_SURFACE) && is_visible( top ) && (rect_diff || eff_diff)) ||
+           (!cross && (top->paint_flags & PAINT_HAS_SURFACE) && eff_diff &&
+            has_cross_process_descendant( win, win->thread->process )) ||
+           /* W15b: re-show under an effectively-hidden chain, cross-process to
+            * the top (same-process windows are excluded: their own cascade
+            * already wakes everything). */
+           (own_show && cross);
+    if (post) post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+    /* W15b: the re-showing window itself must re-run the driver gate — the
+     * W13v2 walk starts at the changed window and only reaches its
+     * descendants, so neither the top post nor the walk can wake the window
+     * that just escaped. The consumer (update_window_state -> apply_window_pos
+     * -> X11DRV_WindowPosChanged) hits the W13 force_unmap path (own_vis &&
+     * !eff_vis, and NtUserIsWindowVisible is a server round-trip so it reads
+     * the post-cascade truth) and XUnmapWindow's the re-mapped X window. */
+    if (own_show)
+    {
+        fprintf( stderr, "DRX-W15b own_show %x top %x\n", win->handle, top->handle );
+        post_message( win->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+    }
+    /* W13v2: the canvas's own thread must see the host hide/show too — its
+     * win32 side never gets a position/visibility message in the msedge
+     * process, so the W13 driver gate never fires without this post. Both
+     * legs (a) and (b) of the existing gate get it; the walk starts at the
+     * window whose visibility changed (the same-process host in leg b). */
+    if (post) post_to_cross_process_descendants( win, win->thread->process );
+    /* W13v4: hide of a window that hides a cross-process descendant (the
+     * WebView2 canvas hole). The app's hide path uses SWP_NOREDRAW, so
+     * expose_window never runs — the W13v2 hole-union below it never
+     * executes, the parent's update region never contains the former hole,
+     * the app never repaints the former canvas area and the never-presented
+     * black X background (background_pixel = 0) is revealed when the canvas
+     * X window is force-unmapped. Invalidate the parent with the hole rect
+     * here, independently of the SWP flags. The W12 post above (same
+     * condition) is an earlier queued message, so the GC-clip hole is
+     * removed in the owner's queue before the lazy WM_PAINT fires and the
+     * paint lands and gets presented. Only the hide leg: on the show leg the
+     * canvas covers the hole again and the GC clip protects it. */
+    if (!is_toplevel( win ) && !is_visible( win ) && eff_diff &&
+        has_cross_process_descendant( win, win->thread->process ))
+    {
+        struct region *hole = create_empty_region();
+        if (hole)
+        {
+            add_cross_process_descendant_rects( win, hole,
+                                                win->client_rect.left - win->window_rect.left,
+                                                win->client_rect.top - win->window_rect.top );
+            if (!is_region_empty( hole ))
+            {
+                fprintf( stderr, "DRX-W13v4 hide_invalidate %x\n", win->handle );
+                offset_region( hole, old_window.left, old_window.top );
+                redraw_window( win->parent, hole, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN, 0 );
+            }
+            free_region( hole );
+        }
+    }
+    if (eff_diff || rect_diff || post)  /* temporary gate trace, quiet on the churn stream */
+        /* W13: own_win = the child's own WS_VISIBLE flag vs vis_win = effective
+         * (is_visible, incl. ancestors) — distinguishes own-flag vs ancestor flips */
+        fprintf( stderr, "DRX-W12 win %x top %x vis_top %d vis_win %d own_win %d old_eff %d cross %d rect %d post %d\n",
+                 win->handle, top->handle, is_visible( top ), is_visible( win ),
+                 !!(win->style & WS_VISIBLE), old_effective, cross, rect_diff, post );
 }
 
 
@@ -3389,32 +3712,37 @@ DECL_HANDLER(set_window_layered_info)
     else set_win32_error( ERROR_INVALID_WINDOW_HANDLE );
 }
 
-/* W8: recursive walk posting WM_WINE_REPRESENT to every visible descendant whose
- * window rect intersects the (screen-coords) dirty rect. The canvas child is
- * nested under the WebView2 container, so the walk must recurse through plain children.
- * NOTE: the server stores every window_rect in screen coordinates (the client-side
- * coords are translated by the set_window_pos request), so the walk must run in screen
- * coords too — the caller maps the request's parent-client rect up first.
+/* W10: recursive walk posting WM_WINE_REPRESENT to every visible cross-process
+ * descendant of the toplevel — same predicate as the W9 clip
+ * clip_cross_process_children (ptr->thread->process != requesting process).
+ * W10 — wake every visible cross-process descendant of the toplevel; the armed
+ * hwnd's identity/rect no longer gate the walk (the deliverable's flush topology
+ * mis-targeted the canvas with the subtree+intersection design).
  * NOTE: the server has NO knowledge of client surfaces (they are a pure client-side
  * win32u/x11drv mechanism — the canvas has no X subwindow and no surface in any
  * process). The posts are therefore blind: the message is a pure queue wake consumed
  * by win32u in the child before the app's window proc, and the pump waking is what
- * makes the child re-composite its content. found = number of wakes posted. */
-static int represent_children_walk( struct window *win, const struct rectangle *screen_rect )
+ * makes the child re-composite its content. found = number of wakes posted.
+ * Each window is visited at most once per request (tree walk), so each is posted
+ * at most once. */
+static int represent_children_walk( struct window *win, struct process *requesting_process )
 {
     struct window *child;
-    struct rectangle intersect;
     int found = 0;
 
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
     {
         if (!(child->style & WS_VISIBLE)) continue;
-        if (!intersect_rect( &intersect, &child->window_rect, screen_rect )) continue;
 
-        post_message( child->handle, WM_WINE_REPRESENT, 0, 0 );
-        found++;
+        if (child->thread->process != requesting_process)
+        {
+            post_message( child->handle, WM_WINE_REPRESENT, 0, 0 );
+            found++;
+        }
 
-        found += represent_children_walk( child, screen_rect );
+        /* keep descending through both same- and cross-process children; the
+         * canvas can be nested under a cross-process container (the WebView2 case) */
+        found += represent_children_walk( child, requesting_process );
     }
     return found;
 }
@@ -3422,15 +3750,14 @@ static int represent_children_walk( struct window *win, const struct rectangle *
 DECL_HANDLER(represent_children)
 {
     struct window *win = get_window( req->handle );
-    struct rectangle screen_rect;
 
     if (!win) return;
 
-    /* map the request rect (handle's client coords) into screen coords */
-    screen_rect = req->rect;
-    offset_rect( &screen_rect, win->client_rect.left, win->client_rect.top );
+    /* W10: root the walk at the toplevel ancestor; the request's rect stays in the
+     * protocol struct but is no longer used for filtering */
+    while (!is_toplevel( win )) win = win->parent;
 
     /* the wake rate is bounded by the client-side arm (>=16 ms per process);
      * no server-side throttle needed */
-    reply->found = represent_children_walk( win, &screen_rect );
+    reply->found = represent_children_walk( win, current->process );
 }
