@@ -2437,8 +2437,9 @@ static void TREEVIEW_DrawItemLineSigns(const TREEVIEW_INFO *infoPtr, HDC hdc,
         int state = (item->state & TVIS_EXPANDED) ? GLPS_OPENED : GLPS_CLOSED;
         RECT glyphRect = item->rect;
 
-        glyphRect.left = item->linesOffset;
-        glyphRect.right = item->stateOffset;
+        glyphRect.left = item->linesOffset - 3;
+        glyphRect.right = item->linesOffset + 17;
+        /* treexpatch v4 2026-10-02 (Dr.Explain C5): themed glyph rect = the app's own expander band; source: GetItemCustomRects (Dr.Explain LeftView.cpp:3262,3269-3274) computes m_expander_full = [textOffset - TEXT_RECT_LEFT_MARGIN - 2*icon.cx - customIndent .. textOffset - TEXT_RECT_LEFT_MARGIN - 3*icon.cx], TEXT_RECT_LEFT_MARGIN = 3 (LeftView.cpp:3262), icon.cx = 20 (GetItemIconSize), customIndent = uIndent = 40 (SetIndent at LeftView.cpp:3234, TVM_SETINDENT); in the live geometry both tree image lists are 20px so textOffset = linesOffset + 80 and the band collapses to [linesOffset - 3 .. linesOffset + 17], width 20 = uIndent(40) - icon.cx(20); uxtheme blits the TVP_GLYPH part at NATIVE SIZE centered in the target rect (dlls/uxtheme/draw.c UXTHEME_DrawImageGlyph, default TMT_HALIGN=HA_CENTER/TMT_VALIGN=VA_CENTER), so the render depends only on the rect center: (linesOffset - 3 + linesOffset + 17)/2 = linesOffset + 7 == v3 center ((linesOffset + stateOffset)/2 - 13) for every level, since stateOffset = linesOffset + uIndent (TREEVIEW_ComputeItemInternalMetrics) = linesOffset + 40 here; replaces v3's empirical -13 edge shift; classic-branch v2 fixes kept for non-themed path */
         DrawThemeBackground(theme, hdc, TVP_GLYPH, state, &glyphRect, NULL);
         return;
     }
@@ -2497,7 +2498,7 @@ static void TREEVIEW_DrawItemLineSigns(const TREEVIEW_INFO *infoPtr, HDC hdc,
 static void
 TREEVIEW_DrawItemLines(const TREEVIEW_INFO *infoPtr, HDC hdc, const TREEVIEW_ITEM *item)
 {
-    LONG centerx, centery;
+    LONG centerx, centery, rectsize;
     BOOL lar = ((infoPtr->dwStyle
 		 & (TVS_LINESATROOT|TVS_HASLINES|TVS_HASBUTTONS))
 		> TVS_LINESATROOT);
@@ -2510,7 +2511,10 @@ TREEVIEW_DrawItemLines(const TREEVIEW_INFO *infoPtr, HDC hdc, const TREEVIEW_ITE
     hbr    = CreateSolidBrush(clrBk);
     hbrOld = SelectObject(hdc, hbr);
 
-    centerx = (item->linesOffset + item->stateOffset) / 2;
+    /* treexpatch v2 2026-10-02 (Dr.Explain C5): drawn center must match app expander band center (~7); user-verified v1 center was ~20 => LEFT-shift 13px */
+    rectsize = min(item->rect.bottom - item->rect.top,
+                   item->stateOffset - item->linesOffset) / 4;
+    centerx = item->linesOffset - rectsize - 12;
     centery = (item->rect.top + item->rect.bottom) / 2;
 
     if (infoPtr->dwStyle & TVS_HASLINES)
