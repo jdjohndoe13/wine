@@ -283,6 +283,8 @@ static void x11drv_client_surface_detach( struct client_surface *client )
     if ((data = get_win_data( hwnd )))
     {
         detach_client_window( data, client_window );
+        /* WS: gdetach row: WARN-only instrument, no behavior change */
+        WARN( "WS: gdetach hwnd %p window %lx\n", hwnd, client_window );
         release_win_data( data );
     }
 }
@@ -320,6 +322,8 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
         if (!offscreen && (data = get_win_data( hwnd )))
         {
             attach_client_window( data, surface->window );
+            /* WS: gattach row: WARN-only instrument, no behavior change */
+            WARN( "WS: gattach hwnd %p window %lx\n", hwnd, surface->window );
             release_win_data( data );
         }
         return;
@@ -363,8 +367,18 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
 
     if ((data = get_win_data( hwnd )))
     {
-        if (offscreen) detach_client_window( data, surface->window );
-        else attach_client_window( data, surface->window );
+        if (offscreen)
+        {
+            detach_client_window( data, surface->window );
+            /* WS: gdetach row: WARN-only instrument, no behavior change */
+            WARN( "WS: gdetach hwnd %p window %lx\n", hwnd, surface->window );
+        }
+        else
+        {
+            attach_client_window( data, surface->window );
+            /* WS: gattach row: WARN-only instrument, no behavior change */
+            WARN( "WS: gattach hwnd %p window %lx\n", hwnd, surface->window );
+        }
         release_win_data( data );
     }
 }
@@ -375,7 +389,63 @@ static void x11drv_client_surface_update( struct client_surface *client )
     HWND hwnd = client->hwnd;
 
     client_surface_update_geometry( hwnd, surface );
+
+    /* WS: gx11 row: WARN-only instrument, no behavior change. Emits on change only: geo digest covers
+     * x/y/width/height of the struct fields the geometry manager writes (surface->changes); the map
+     * flag is client.offscreen (the attach/detach state). Stamps stored only when a row is emitted. */
+    {
+        RECT rect = surface->client.raw ? surface->client.monitor_rect : surface->client.virtual_rect;
+        unsigned int offscreen = surface->client.offscreen ? 1 : 0;
+        unsigned int map_changed = (offscreen != (unsigned int)surface->last_map_state);
+        DWORD geo = ((unsigned int)surface->changes.x * 214013u) ^
+                    ((unsigned int)surface->changes.y * 2531011u) ^
+                    ((unsigned int)surface->changes.width * 1000003u) ^
+                    ((unsigned int)surface->changes.height * 83492791u);
+        unsigned int geo_changed = (geo != surface->last_geo);
+
+        if ((map_changed || geo_changed) &&
+            rect.right - rect.left >= 300 && rect.bottom - rect.top >= 200)
+        {
+            WARN( "WS: gx11 hwnd %p window %lx map_changed %u geo_changed %u offscreen %u\n",
+                  hwnd, surface->window, map_changed, geo_changed, offscreen );
+            surface->last_map_state = (DWORD)offscreen;
+            surface->last_geo = geo;
+        }
+    }
+
     client_surface_update_offscreen( hwnd, surface );
+}
+
+/* W2 instrumentation: probe helpers, no behavior change */
+static int client_probe_handler( Display *display, XErrorEvent *event, void *arg )
+{
+    return (event->request_code == X_GetImage && event->error_code == BadMatch);
+}
+
+/* read the middle row of a drawable and count white-pixel probes out of 16 */
+static unsigned int probe_drawable_white( Window window, int width, int height, BOOL *readable )
+{
+    unsigned int count = 0, i;
+    XImage *image;
+
+    if (readable) *readable = FALSE;
+    if (width < 1 || height < 1 || !window) return 0;
+
+    X11DRV_expect_error( gdi_display, client_probe_handler, NULL );
+    image = XGetImage( gdi_display, window, 0, height / 2, width, 1, AllPlanes, ZPixmap );
+    if (!X11DRV_check_error() && image)
+    {
+        if (readable) *readable = TRUE;
+        if (image->bits_per_pixel == 32)
+            for (i = 0; i < 16; i++)
+            {
+                int x = i * (width - 1) / 16;
+                if ((XGetPixel( image, x, 0 ) & 0xffffff) == 0xffffff) count++;
+            }
+    }
+    if (image) XDestroyImage( image );
+
+    return count;
 }
 
 static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc )
@@ -385,6 +455,8 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
     RECT rect_dst = client->monitor_rect, rect_src, rect;
     Drawable window;
     HRGN region;
+    unsigned int white = 0, pct = 0;
+    BOOL readable = FALSE;
 
     if (!hdc) return;
     window = X11DRV_get_whole_window( toplevel );
@@ -396,6 +468,15 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
     rect_src = surface->client.raw ? surface->client.monitor_rect : surface->client.virtual_rect;
     TRACE( "hwnd %p %s to toplevel %p %s region %p\n", hwnd, wine_dbgstr_rect(&rect_src),
            toplevel, wine_dbgstr_rect(&rect_dst), region );
+
+    if (surface->window && rect_src.right - rect_src.left >= 300 && rect_src.bottom - rect_src.top >= 200)
+    {
+        white = probe_drawable_white( surface->window, surface->changes.width, surface->changes.height, &readable );
+        pct = white * 100 / 16;
+    }
+    WARN( "WS: client present %s toplevel %p src %lx readable %u white %%%u src %s dst %s\n",
+          debugstr_client_surface( client ), toplevel, surface->window, readable, pct,
+          wine_dbgstr_rect( &rect_src ), wine_dbgstr_rect( &rect_dst ) );
 
     if (get_dc_drawable( surface->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
         set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );

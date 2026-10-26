@@ -577,6 +577,17 @@ void client_surface_present( struct client_surface *surface )
 
     pthread_mutex_lock( &surfaces_lock );
 
+    /* WS: presentq row: WARN-only instrument, no behavior change */
+    {
+        static DWORD ws_last_presentq;
+        DWORD ws_now = NtGetTickCount();
+        if (ws_now - ws_last_presentq > 1000)
+        {
+            ws_last_presentq = ws_now;
+            WARN( "WS: presentq hwnd %p surface %p\n", surface->hwnd, surface );
+        }
+    }
+
     if ((hwnd = surface->hwnd))
     {
         client_surface_update_locked( surface );
@@ -672,7 +683,7 @@ static void ws_reattach_compose_surface( HWND hwnd, HWND surface_win, const char
      * rect origin */
     rect = child_rects.client;
     OffsetRect( &rect, -owner_rects.visible.left, -owner_rects.visible.top );
-    if (rect.right - rect.left < 300 || rect.bottom - rect.top < 200)  /* only recompose big hosts */
+    if (rect.right - rect.left < 300 || rect.bottom - rect.top < 200)  /* same big-rect gate family as dce.c ws_probe_big */
     {
         window_surface_release( surface );
         return;
@@ -684,6 +695,8 @@ static void ws_reattach_compose_surface( HWND hwnd, HWND surface_win, const char
     window_surface_unlock( surface );
     window_surface_flush( surface );
     window_surface_release( surface );
+
+    WARN( "WS: reattach hwnd %p rect %s surface %p hook %s\n", hwnd, wine_dbgstr_rect( &rect ), surface, hook );
 }
 
 /* W5 white-out fix: find an attached client surface on the window itself or, failing that,
@@ -711,7 +724,7 @@ static struct client_surface *ws_find_attached_surface_subtree( HWND hwnd, UINT 
 
     if (&surface->entry != &client_surfaces) return surface;
 
-    /* else search the child subtree */
+    /* else search the child subtree, same enumeration idiom as dce.c ws_probe_big */
     if ((list = list_window_children( hwnd )))
     {
         for (i = 0; list[i]; i++)
@@ -766,6 +779,7 @@ void ws_w8_arm_wake( HWND hwnd, const RECT *rect )
 
 void ws_w8_flush_wake( void )
 {
+    int found = 0;
     HWND hwnd;
     RECT rect;
 
@@ -796,9 +810,11 @@ void ws_w8_flush_wake( void )
     {
         req->handle = wine_server_user_handle( hwnd );
         req->rect   = wine_server_rectangle( rect );
-        wine_server_call( req );
+        if (!wine_server_call( req )) found = reply->found;
     }
     SERVER_END_REQ;
+
+    WARN( "WS: w8req hwnd %p rect %s found %u\n", hwnd, wine_dbgstr_rect( &rect ), found );
 
     InterlockedExchange( &ws_w8_in_flush, 0 );
 }
@@ -825,12 +841,14 @@ static void ws_compose_on_show( HWND hwnd, const char *hook )
     if (win == WND_OTHER_PROCESS)
     {
         client_surface_release( surface );
+        WARN( "WS: redirty hook %s hwnd %p skipped cross-proc\n", hook, hwnd );
         return;
     }
     release_win_ptr( win );
 
     ws_reattach_compose_surface( surf_hwnd, root, hook );
     client_surface_present( surface );
+    WARN( "WS: redirty hook %s hwnd %p subtree %p surface %p root %p\n", hook, hwnd, surf_hwnd, surface, root );
     client_surface_release( surface );
 }
 
@@ -853,6 +871,7 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
 
         /* surface wasn't used, it shouldn't be in any list */
         list_add_tail( &client_surfaces, &surface->entry );
+        WARN( "WS: attach client surface %s hwnd %p\n", debugstr_client_surface( surface ), surface->hwnd );
         client_surface_update_locked( surface );
         attach_hwnd = surface->hwnd;
     }
@@ -860,6 +879,7 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
     {
         list_remove( &surface->entry ); /* remove it from client_surfaces, if it was used */
         list_add_head( &unused_surfaces, &surface->entry ); /* add it to the head, so we discard older ones */
+        WARN( "WS: park client surface %s hwnd %p (content retained)\n", debugstr_client_surface( surface ), surface->hwnd );
         client_surface_add_ref( surface );
     }
 
@@ -2816,6 +2836,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     if (ret)
     {
         TRACE( "win %p surface %p -> %p\n", hwnd, old_surface, new_surface );
+        WARN( "WS: swp hwnd %p old_surface %p new_surface %p flags %04x show %u hide %u\n", hwnd, old_surface,
+              new_surface, swp_flags, !!(swp_flags & SWP_SHOWWINDOW), !!(swp_flags & SWP_HIDEWINDOW) );
         /* W5 white-out fix (show hook): widen the W4 show hook beyond the flipping node itself —
          * the attached client surface usually lives on a descendant (canvas child) and is still
          * attached (never parked) at show time. Keep the W4 row verbatim (hook "show") for the
@@ -2835,6 +2857,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             if (sub_surface)
             {
                 client_surface_present( sub_surface );
+                WARN( "WS: redirty hook show-attach hwnd %p subtree %p surface %p root %p\n", hwnd,
+                      surf_hwnd, sub_surface, NtUserGetAncestor( hwnd, GA_ROOT ) );
                 client_surface_release( sub_surface );
             }
         }

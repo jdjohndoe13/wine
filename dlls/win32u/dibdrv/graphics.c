@@ -1185,10 +1185,46 @@ BOOL dibdrv_PatBlt( PHYSDEV dev, struct bitblt_coords *dst, DWORD rop )
     DWORD and = 0, xor = 0;
     BOOL ret = TRUE;
 
+    /* WS: pblt instrument-only locals (no behavior change) */
+    RECT pb_box;
+    INT pb_type;
+    const char *pb_clip_box;
+
     TRACE("(%p, %d, %d, %d, %d, %06x)\n", dev, dst->x, dst->y, dst->width, dst->height, rop);
 
     add_clipped_bounds( pdev, &dst->visrect, 0 );
     if (!get_clipped_rects( &pdev->dib, &dst->visrect, pdev->clip, &clipped_rects )) return TRUE;
+
+    /* WS: pblt row: WARN-only instrument, no behavior change */
+    if ((rop == PATCOPY || rop == WHITENESS) &&
+        dst->visrect.right - dst->visrect.left >= 300 && dst->visrect.bottom - dst->visrect.top >= 200)
+    {
+        pb_clip_box = "-";
+        if (pdev->clip)
+        {
+            pb_type = NtGdiGetRgnBox( pdev->clip, &pb_box );
+            if (pb_type != ERROR) pb_clip_box = wine_dbgstr_rect( &pb_box );
+        }
+        WARN( "WS: pblt hdc %p rop %08x rect %s clip %p clip_box %s n %u\n",
+              dc->hSelf, rop, wine_dbgstr_rect( &dst->visrect ), pdev->clip,
+              pb_clip_box, (unsigned int)clipped_rects.count );
+    }
+
+    /* WS: pblt2 row: WARN-only instrument, no behavior change. Finer census: same rop gate as the
+     * WS: pblt row but any size >= 8x8 (the >=300x200 gate above stays on the WS: pblt row alone),
+     * throttled to one row per second. */
+    if ((rop == PATCOPY || rop == WHITENESS) &&
+        dst->visrect.right - dst->visrect.left >= 8 && dst->visrect.bottom - dst->visrect.top >= 8)
+    {
+        static DWORD ws_last_pblt2;
+        DWORD ws_now = NtGetTickCount();
+        if (ws_now - ws_last_pblt2 > 1000)
+        {
+            ws_last_pblt2 = ws_now;
+            WARN( "WS: pblt2 hdc %p rop %08x rect %s\n",
+                  dc->hSelf, rop, wine_dbgstr_rect( &dst->visrect ) );
+        }
+    }
 
     switch (rop2)  /* shortcuts for rops that don't involve the brush */
     {

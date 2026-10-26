@@ -1425,6 +1425,9 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
     {
         /* Track-3 v3: the WM already refused this exact config; re-requesting re-fires
          * the geometry war. Converge the X-side state to the delivered config instead. */
+        WARN( "Track-3 v3: window %p/%lx suppressing re-request of refused config %s (round %u)\n",
+              data->hwnd, data->whole_window, wine_dbgstr_rect( new_rect ),
+              data->config_refuse_count );
         data->config_refuse_count++;
         data->desired_state.rect = data->current_state.rect;
         data->pending_state.rect = data->current_state.rect;
@@ -1672,6 +1675,24 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
     case MAKELONG(NormalState, IconicState):
         if (!data->embedded) XIconifyWindow( data->display, data->whole_window, data->vis.screen );
         break;
+    }
+
+    /* W13: correlate the map/unmap X calls with the force_unmap decision;
+     * only for cross-process children to avoid log spam. */
+    if (is_cross_process_child( data->hwnd ))
+    {
+        switch (MAKELONG(old_state, new_state))
+        {
+        case MAKELONG(WithdrawnState, IconicState):
+        case MAKELONG(WithdrawnState, NormalState):
+        case MAKELONG(IconicState, NormalState):
+            WARN( "DRX-W13 xmap hwnd=%p state=%d\n", data->hwnd, new_state );
+            break;
+        case MAKELONG(NormalState, WithdrawnState):
+        case MAKELONG(IconicState, WithdrawnState):
+            WARN( "DRX-W13 xunmap hwnd=%p state=%d\n", data->hwnd, new_state );
+            break;
+        }
     }
 
     /* override redirect windows won't receive WM_STATE property changes */
@@ -2374,6 +2395,7 @@ void detach_client_window( struct x11drv_win_data *data, Window client_window )
     }
 
     data->client_window = 0;
+    WARN( "WS: detach client window %lx hwnd %p\n", client_window, data->hwnd );
 }
 
 
@@ -2396,6 +2418,7 @@ void attach_client_window( struct x11drv_win_data *data, Window client_window )
     }
 
     data->client_window = client_window;
+    WARN( "WS: attach client window %lx hwnd %p\n", client_window, data->hwnd );
 }
 
 
@@ -3405,6 +3428,8 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
         if (own_vis && !eff_vis)
         {
+            WARN( "DRX-W13 force_unmap hwnd=%p whole_window=%lu own_vis=%d eff_vis=%d cross=%d\n",
+                  hwnd, (unsigned long)data->whole_window, own_vis, eff_vis, TRUE );
             new_style &= ~WS_VISIBLE;
         }
     }

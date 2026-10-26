@@ -889,10 +889,13 @@ DWORD dibdrv_GetImage( PHYSDEV dev, BITMAPINFO *info, struct gdi_image_bits *bit
                        struct bitblt_coords *src )
 {
     dibdrv_physdev *pdev = get_dibdrv_pdev(dev);
+    DWORD ret;
 
     TRACE( "%p %p\n", dev, info );
 
-    return get_image_dib_info( &pdev->dib, info, bits, src );
+    ret = get_image_dib_info( &pdev->dib, info, bits, src );
+
+    return ret;
 }
 
 static BOOL matching_color_info( const dib_info *dib, const BITMAPINFO *info, BOOL allow_mask_rect )
